@@ -18,7 +18,7 @@ crystal build CrystalPotato.cr -o CrystalPotato.exe --release --static
 
 ## Usage
 
-Execute a command, start a reverse shell, or create a local admin — all as SYSTEM.
+Execute a command, start a reverse shell, or create a local admin.
 
 ```
 CrystalPotato.exe -c <COMMAND>
@@ -43,5 +43,6 @@ CrystalPotato.exe -u <USER> -pw <PASS>
 
 ## Sources
 
-- [GodPotato](https://github.com/BeichenDream/GodPotato) — Original C# implementation by [BeichenDream](https://github.com/BeichenDream).
-- [RustPotato](https://github.com/safedv/RustPotato) — Rust implementation by [safedv](https://github.com/safedv).
+- [GodPotato](https://github.com/BeichenDream/GodPotato): Original C# implementation by [BeichenDream](https://github.com/BeichenDream).
+- [RustPotato](https://github.com/safedv/RustPotato): Rust implementation by [safedv](https://github.com/safedv).
+- [SigmaPotato](https://github.com/tylerdotrar/SigmaPotato): Implementation by [tylerdotrar](https://github.com/tylerdotrar).
