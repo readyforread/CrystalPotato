@@ -15,7 +15,6 @@ Windows APIs are resolved dynamically and invoked through indirect syscall stubs
 crystal build CrystalPotato.cr -o CrystalPotato.exe --release --static
 ```
 
-
 ## Usage
 
 Execute a command, start a reverse shell, or create a local admin.
@@ -28,9 +27,9 @@ CrystalPotato.exe -u <USER> -pw <PASS>
 
 | Flag | Description |
 |---|---|
-| `-c CMD` | Command to execute as SYSTEM, or shell for reverse shell (default: `cmd.exe`) |
-| `-H HOST` | Reverse shell listener host |
-| `-P PORT` | Reverse shell listener port |
+| `-c CMD` | Command to execute as SYSTEM or shell for reverse shell (default: `cmd.exe`) |
+| `-H HOST` | Reverse shell listener Host |
+| `-P PORT` | Reverse shell listener Port |
 | `-u USER` | Create local admin - Username |
 | `-pw PASS` | Create local admin - Password |
 | `-p NAME` | Custom pipe name (default: `Crystal`) |
