@@ -31,8 +31,8 @@ CrystalPotato.exe -u <USER> -pw <PASS>
 | `-c CMD` | Command to execute as SYSTEM, or shell for reverse shell (default: `cmd.exe`) |
 | `-H HOST` | Reverse shell listener host |
 | `-P PORT` | Reverse shell listener port |
-| `-u USER` | Create local admin — username |
-| `-pw PASS` | Create local admin — password |
+| `-u USER` | Create local admin - Username |
+| `-pw PASS` | Create local admin - Password |
 | `-p NAME` | Custom pipe name (default: `Crystal`) |
 | `-d` | Debug output |
 | `-dd` | Full trace |
