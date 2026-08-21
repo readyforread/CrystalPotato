@@ -2,7 +2,7 @@
 
 Crystal port of GodPotato, a local privilege escalation from accounts with `SeImpersonatePrivilege` to SYSTEM. It works by abusing the DCOM OXID Resolver and named pipe impersonation.
 
-Windows APIs are resolved dynamically and invoked through indirect syscall stubs, all strings are XOR-obfuscated at compile time and by default only the command output is printed.
+Windows APIs are resolved dynamically and invoked through indirect syscall stubs, all strings are XOR-obfuscated at compile time and by default only the command output is printed. Tested on Windows 10, 11 and Server 2025.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/ricardojoserf/ricardojoserf.github.io/master/images/CrystalPotato/Screenshot_1.png" alt="CrystalPotato" width="420">
@@ -11,9 +11,12 @@ Windows APIs are resolved dynamically and invoked through indirect syscall stubs
 
 ## Build
 
+CrystalPotato compiles to a single file with no dependencies using [Crystal on Windows](https://crystal-lang.org/install/on_windows/):
+
 ```
 crystal build CrystalPotato.cr -o CrystalPotato.exe --release --static
 ```
+
 
 ## Usage
 
@@ -42,6 +45,8 @@ CrystalPotato.exe -u <USER> -pw <PASS>
 
 ## Sources
 
-- [GodPotato](https://github.com/BeichenDream/GodPotato): Original C# implementation by [BeichenDream](https://github.com/BeichenDream).
-- [RustPotato](https://github.com/safedv/RustPotato): Rust implementation by [safedv](https://github.com/safedv).
-- [SigmaPotato](https://github.com/tylerdotrar/SigmaPotato): Implementation by [tylerdotrar](https://github.com/tylerdotrar).
+- [GodPotato](https://github.com/BeichenDream/GodPotato) - Original C# implementation by [BeichenDream](https://github.com/BeichenDream).
+
+- [RustPotato](https://github.com/safedv/RustPotato) - Rust implementation by [safedv](https://github.com/safedv).
+
+- [SigmaPotato](https://github.com/tylerdotrar/SigmaPotato) - C# implementation with extra functionalities by [tylerdotrar](https://github.com/tylerdotrar).
