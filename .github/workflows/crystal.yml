@@ -10,31 +10,49 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Install msys2 mingw deps
+        shell: pwsh
+        run: |
+          & C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed `
+            mingw-w64-x86_64-gcc `
+            mingw-w64-x86_64-libgc `
+            mingw-w64-x86_64-pcre2 `
+            mingw-w64-x86_64-libiconv `
+            mingw-w64-x86_64-zlib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Download Crystal
         shell: pwsh
         run: |
-          $release = Invoke-RestMethod https://api.github.com/repos/crystal-lang/crystal/releases/latest
-          $asset = $release.assets |
-            Where-Object { $_.name -like '*windows*x86_64*.zip' -and $_.name -notlike '*symbols*' -and $_.name -notlike '*debug*' } |
-            Select-Object -First 1
-          if (-not $asset) { Write-Error "no windows asset"; exit 1 }
-          Write-Host "Downloading $($asset.name)"
-          Invoke-WebRequest $asset.browser_download_url -OutFile crystal.zip
+          $r = Invoke-RestMethod https://api.github.com/repos/crystal-lang/crystal/releases/latest
+          $a = $r.assets | Where-Object {
+            $_.name -like '*windows-x86_64.zip' -and $_.name -notlike '*debug*'
+          } | Select-Object -First 1
+          Write-Host "Asset: $($a.name)"
+          Invoke-WebRequest $a.browser_download_url -OutFile crystal.zip
           Expand-Archive crystal.zip -DestinationPath crystal -Force
+          $exe = Get-ChildItem -Recurse crystal -Filter crystal.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "crystal.exe not found"; exit 1 }
+          Write-Host "Crystal: $($exe.FullName)"
+          "CRYSTAL_BIN=$($exe.DirectoryName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-          $crystalExe = Get-ChildItem -Recurse crystal -Filter crystal.exe | Select-Object -First 1
-          if (-not $crystalExe) { Write-Error "crystal.exe not found"; exit 1 }
-          $binDir = $crystalExe.DirectoryName
-          Write-Host "Crystal bin: $binDir"
-          Add-Content $env:GITHUB_PATH $binDir
-          Add-Content $env:GITHUB_ENV "CRYSTAL_BIN=$binDir"
-
-      - name: Crystal version
+      - name: Setup PATH
         shell: pwsh
-        run: crystal --version
+        run: |
+          # GH prepends: last written wins. Want crystal first, msys2 second.
+          "C:\msys64\mingw64\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+          "${{ env.CRYSTAL_BIN }}" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+          "LIB=C:\msys64\mingw64\lib"          | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "LIBRARY_PATH=C:\msys64\mingw64\lib" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          where.exe cc
+          cc --version
+          crystal --version
 
       - name: Build
         shell: pwsh
@@ -42,17 +60,22 @@ jobs:
           New-Item -ItemType Directory -Force -Path build | Out-Null
           crystal build --release --no-debug CrystalPotato.cr -o build/CrystalPotato.exe
 
-      - name: Copy runtime DLLs
+      - name: Bundle runtime DLLs
         shell: pwsh
         run: |
-          $binDir = $env:CRYSTAL_BIN
-          Copy-Item "$binDir\libgc.dll" build\ -ErrorAction SilentlyContinue
-          Copy-Item "$binDir\libpcre2-8.dll" build\ -ErrorAction SilentlyContinue
-          Copy-Item "$binDir\*.dll" build\ -ErrorAction SilentlyContinue
+          $dlls = @(
+            "C:\msys64\mingw64\bin\libgc-1.dll",
+            "C:\msys64\mingw64\bin\libpcre2-8-0.dll",
+            "C:\msys64\mingw64\bin\libiconv-2.dll",
+            "C:\msys64\mingw64\bin\zlib1.dll",
+            "C:\msys64\mingw64\bin\libwinpthread-1.dll"
+          )
+          foreach ($d in $dlls) {
+            if (Test-Path $d) { Copy-Item $d build\ }
+          }
           Get-ChildItem build\
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: CrystalPotato-x64
           path: build/
