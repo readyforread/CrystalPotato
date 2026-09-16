@@ -13,32 +13,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Scoop
+      - name: Download Crystal
         shell: pwsh
         run: |
-          Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          $release = Invoke-RestMethod https://api.github.com/repos/crystal-lang/crystal/releases/latest
+          $asset = $release.assets |
+            Where-Object { $_.name -like '*windows*x86_64*.zip' -and $_.name -notlike '*symbols*' -and $_.name -notlike '*debug*' } |
+            Select-Object -First 1
+          if (-not $asset) { Write-Error "no windows asset"; exit 1 }
+          Write-Host "Downloading $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile crystal.zip
+          Expand-Archive crystal.zip -DestinationPath crystal -Force
 
-      - name: Install Crystal
+          $crystalExe = Get-ChildItem -Recurse crystal -Filter crystal.exe | Select-Object -First 1
+          if (-not $crystalExe) { Write-Error "crystal.exe not found"; exit 1 }
+          $binDir = $crystalExe.DirectoryName
+          Write-Host "Crystal bin: $binDir"
+          Add-Content $env:GITHUB_PATH $binDir
+          Add-Content $env:GITHUB_ENV "CRYSTAL_BIN=$binDir"
+
+      - name: Crystal version
         shell: pwsh
-        run: |
-          scoop install crystal
-          $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
-          crystal --version
+        run: crystal --version
 
       - name: Build
         shell: pwsh
         run: |
-          $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
           New-Item -ItemType Directory -Force -Path build | Out-Null
           crystal build --release --no-debug CrystalPotato.cr -o build/CrystalPotato.exe
 
       - name: Copy runtime DLLs
         shell: pwsh
         run: |
-          $cbin = "$env:USERPROFILE\scoop\apps\crystal\current\bin"
-          Copy-Item "$cbin\libgc.dll" build\ -ErrorAction SilentlyContinue
-          Copy-Item "$cbin\libpcre2-8.dll" build\ -ErrorAction SilentlyContinue
+          $binDir = $env:CRYSTAL_BIN
+          Copy-Item "$binDir\libgc.dll" build\ -ErrorAction SilentlyContinue
+          Copy-Item "$binDir\libpcre2-8.dll" build\ -ErrorAction SilentlyContinue
+          Copy-Item "$binDir\*.dll" build\ -ErrorAction SilentlyContinue
           Get-ChildItem build\
 
       - name: Upload
