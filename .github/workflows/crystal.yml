@@ -12,43 +12,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install msys2 mingw deps
-        shell: pwsh
-        run: |
-          & C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed `
-            mingw-w64-x86_64-gcc `
-            mingw-w64-x86_64-gc `
-            mingw-w64-x86_64-pcre2 `
-            mingw-w64-x86_64-libiconv `
-            mingw-w64-x86_64-zlib
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Install Crystal
+        uses: crystal-lang/install-crystal@v1
 
-      - name: Verify libs
+      - name: Verify
         shell: pwsh
         run: |
-          Get-ChildItem C:\msys64\mingw64\lib\libgc* -ErrorAction SilentlyContinue
-          Get-ChildItem C:\msys64\mingw64\lib\libpcre2* -ErrorAction SilentlyContinue
-
-      - name: Download Crystal
-        shell: pwsh
-        run: |
-          $r = Invoke-RestMethod https://api.github.com/repos/crystal-lang/crystal/releases/latest
-          $a = $r.assets | Where-Object {
-            $_.name -like '*windows-x86_64.zip' -and $_.name -notlike '*debug*'
-          } | Select-Object -First 1
-          Write-Host "Asset: $($a.name)"
-          Invoke-WebRequest $a.browser_download_url -OutFile crystal.zip
-          Expand-Archive crystal.zip -DestinationPath crystal -Force
-          $exe = Get-ChildItem -Recurse crystal -Filter crystal.exe | Select-Object -First 1
-          "CRYSTAL_BIN=$($exe.DirectoryName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Setup PATH
-        shell: pwsh
-        run: |
-          "C:\msys64\mingw64\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
-          "${{ env.CRYSTAL_BIN }}" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
-          "LIB=C:\msys64\mingw64\lib"          | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "LIBRARY_PATH=C:\msys64\mingw64\lib" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          crystal --version
+          where.exe crystal
 
       - name: Build
         shell: pwsh
@@ -59,10 +30,10 @@ jobs:
       - name: Bundle DLLs
         shell: pwsh
         run: |
-          foreach ($d in @("libgc-1.dll","libpcre2-8-0.dll","libiconv-2.dll","zlib1.dll","libwinpthread-1.dll")) {
-            $p = "C:\msys64\mingw64\bin\$d"
-            if (Test-Path $p) { Copy-Item $p build\ }
-          }
+          $binDir = Split-Path (Get-Command crystal).Source -Parent
+          Write-Host "bin=$binDir"
+          Get-ChildItem "$binDir\*.dll" -ErrorAction SilentlyContinue |
+            Copy-Item -Destination build\ -ErrorAction SilentlyContinue
           Get-ChildItem build\
 
       - uses: actions/upload-artifact@v4
@@ -70,4 +41,3 @@ jobs:
           name: CrystalPotato-x64
           path: build/
           if-no-files-found: error
-          retention-days: 30
