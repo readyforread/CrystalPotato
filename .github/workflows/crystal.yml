@@ -1,0 +1,50 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Scoop
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
+          iwr -useweb get.scoop.sh | iex
+
+      - name: Install Crystal
+        shell: pwsh
+        run: |
+          scoop install crystal
+          $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
+          crystal --version
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          crystal build --release --no-debug CrystalPotato.cr -o build/CrystalPotato.exe
+
+      - name: Copy runtime DLLs
+        shell: pwsh
+        run: |
+          $cbin = "$env:USERPROFILE\scoop\apps\crystal\current\bin"
+          Copy-Item "$cbin\libgc.dll" build\ -ErrorAction SilentlyContinue
+          Copy-Item "$cbin\libpcre2-8.dll" build\ -ErrorAction SilentlyContinue
+          Get-ChildItem build\
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrystalPotato-x64
+          path: build/
+          if-no-files-found: error
+          retention-days: 30
