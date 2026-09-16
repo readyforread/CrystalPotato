@@ -17,11 +17,17 @@ jobs:
         run: |
           & C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed `
             mingw-w64-x86_64-gcc `
-            mingw-w64-x86_64-libgc `
+            mingw-w64-x86_64-gc `
             mingw-w64-x86_64-pcre2 `
             mingw-w64-x86_64-libiconv `
             mingw-w64-x86_64-zlib
           if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Verify libs
+        shell: pwsh
+        run: |
+          Get-ChildItem C:\msys64\mingw64\lib\libgc* -ErrorAction SilentlyContinue
+          Get-ChildItem C:\msys64\mingw64\lib\libpcre2* -ErrorAction SilentlyContinue
 
       - name: Download Crystal
         shell: pwsh
@@ -34,25 +40,15 @@ jobs:
           Invoke-WebRequest $a.browser_download_url -OutFile crystal.zip
           Expand-Archive crystal.zip -DestinationPath crystal -Force
           $exe = Get-ChildItem -Recurse crystal -Filter crystal.exe | Select-Object -First 1
-          if (-not $exe) { Write-Error "crystal.exe not found"; exit 1 }
-          Write-Host "Crystal: $($exe.FullName)"
           "CRYSTAL_BIN=$($exe.DirectoryName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Setup PATH
         shell: pwsh
         run: |
-          # GH prepends: last written wins. Want crystal first, msys2 second.
           "C:\msys64\mingw64\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
           "${{ env.CRYSTAL_BIN }}" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
           "LIB=C:\msys64\mingw64\lib"          | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "LIBRARY_PATH=C:\msys64\mingw64\lib" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Verify toolchain
-        shell: pwsh
-        run: |
-          where.exe cc
-          cc --version
-          crystal --version
 
       - name: Build
         shell: pwsh
@@ -60,18 +56,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path build | Out-Null
           crystal build --release --no-debug CrystalPotato.cr -o build/CrystalPotato.exe
 
-      - name: Bundle runtime DLLs
+      - name: Bundle DLLs
         shell: pwsh
         run: |
-          $dlls = @(
-            "C:\msys64\mingw64\bin\libgc-1.dll",
-            "C:\msys64\mingw64\bin\libpcre2-8-0.dll",
-            "C:\msys64\mingw64\bin\libiconv-2.dll",
-            "C:\msys64\mingw64\bin\zlib1.dll",
-            "C:\msys64\mingw64\bin\libwinpthread-1.dll"
-          )
-          foreach ($d in $dlls) {
-            if (Test-Path $d) { Copy-Item $d build\ }
+          foreach ($d in @("libgc-1.dll","libpcre2-8-0.dll","libiconv-2.dll","zlib1.dll","libwinpthread-1.dll")) {
+            $p = "C:\msys64\mingw64\bin\$d"
+            if (Test-Path $p) { Copy-Item $p build\ }
           }
           Get-ChildItem build\
 
