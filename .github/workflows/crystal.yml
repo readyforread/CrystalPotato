@@ -17,7 +17,7 @@ jobs:
         shell: pwsh
         run: |
           Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-          iwr -useweb get.scoop.sh | iex
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
 
       - name: Install Crystal
         shell: pwsh
